@@ -1,0 +1,43 @@
+{
+  "id": "spotify-soloist",
+  "name": "Spotify Soloist",
+  "version": "0.1.0",
+  "minAppVersion": "0.1.8",
+  "main": "index.js",
+  "playback": "remote",
+  "permissions": {
+    "network": [
+      "api.spotify.com",
+      "accounts.spotify.com",
+      "lrclib.net"
+    ],
+    "process": [
+      "bin/soloist.exe",
+      "powershell.exe"
+    ]
+  },
+  "settings": [
+    {
+      "key": "clientId",
+      "label": "Client ID",
+      "help": "Your Spotify Web API app Client ID. Add http://127.0.0.1:43110/callback as its redirect URI. Soloist API key setup is separate.",
+      "link": "https://developer.spotify.com/dashboard"
+    }
+  ],
+  "navigation": [
+    {
+      "builtin": "home"
+    },
+    {
+      "builtin": "liked"
+    },
+    {
+      "builtin": "savedAlbums"
+    },
+    {
+      "title": "Playback Status",
+      "page": "soloist",
+      "icon": "note"
+    }
+  ]
+}
