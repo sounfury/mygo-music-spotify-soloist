@@ -114,7 +114,7 @@ sounfury/mygo-music-spotify-soloist
 - **Prompted to save Soloist API key first**: Entering your key directly in **Soloist API Key** in plugin settings is recommended. If using the optional helper script, run the setup command under the same OS user account running MyGo.
 - **Waiting for pairing / endless connection attempt**: Ensure your phone and PC are on the exact same local Wi-Fi / LAN subnet. Try selecting `MyGo Soloist` in the mobile Spotify app's device list. Multiple network adapters, virtual VPN interfaces, or strict firewall policies can disrupt multicast discovery.
 - **Paired but device is not visible to this account**: Verify that both the plugin Web API sign-in and the mobile Spotify app use the identical Spotify account. Allow a few seconds after cold boot for device registration.
-- **Playback volume is low or inaudible**: Soloist device volume, the Windows volume mixer slider for MyGo, and the master system output volume each take effect independently. Check all three.
+- **Playback volume is low or inaudible**: Soloist device volume and the master system output volume (plus the Windows volume mixer slider for MyGo, or the default Core Audio output device on macOS) each take effect independently. Check them all.
 - **Instance already running**: If you previously launched Soloist manually, stop the manual process before letting the plugin manage it. Keeping the default data directory preserves your existing pairing.
 
 ## Development & Testing
@@ -130,7 +130,7 @@ node --test tests/plugin.test.cjs
 
 Local verification includes Soloist cold start, pairing restoration, Spotify catalog browsing, direct queue playback, playback controls (pause/resume/seek/volume), and verified audio output via MyGo. Other operating systems or custom account setups require independent validation.
 
-Installing does not require GitHub Releases: MyGo installs directly from the latest commit on the default branch. The repository uses the `mygo-music-plugin` topic for automatic discovery on the [MyGo Plugin Directory](https://mygo-music.egoist.dev/plugins).
+This repository publishes versioned GitHub Releases: when releases exist, MyGo Music installs and updates from the latest GitHub Release source archive automatically (no manual binary attachments required; repositories without releases fall back to the default branch's latest commit). Upgrading from `v1.1.x` to `v1.2.0` adds `bin/soloist` and `/bin/sh` process permissions for macOS, so MyGo will prompt you to re-approve permissions. The repository uses the `mygo-music-plugin` topic for automatic discovery on the [MyGo Plugin Directory](https://mygo-music.egoist.dev/plugins).
 
 ## License
 

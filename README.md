@@ -114,7 +114,7 @@ sounfury/mygo-music-spotify-soloist
 - **提示先保存 API Key**：推荐直接在插件设置的 **Soloist API Key** 中填写；如使用可选脚本模式，请以与启动 MyGo Music 相同的系统用户执行对应平台的 setup 命令。
 - **提示等待配对或一直卡在正在连接**：请确保手机与电脑在同一局域网（同一 Wi-Fi 或子网），并在手机官方 Spotify App 的设备列表中选择 `MyGo Soloist`。多虚拟网卡、VPN 代理或严格的防火墙规则可能会阻碍局域网设备组播发现。
 - **已成功配对但当前账号找不到设备**：插件绑定的 Web API 账号与手机端登录的 Spotify 账号必须为同一账号；此外冷启动后设备注册到云端可能需要数秒缓冲。
-- **声音过小或无声**：Soloist 设备音量、Windows 应用程序音量合成器中的 MyGo 音量以及 Windows 输出设备主音量各自独立生效，请依次排查。
+- **声音过小或无声**：Soloist 设备音量、系统输出设备主音量（Windows 上还包括音量合成器中的 MyGo 音量，macOS 上请检查系统默认 Core Audio 输出设备）各自独立生效，请依次排查。
 - **已有实例在运行**：若此前手动启动过 Soloist，请先退出手动进程再由插件统一管理。保留默认数据路径即可无缝复用已有配对。
 
 ## 开发与验证
@@ -130,7 +130,7 @@ node --test tests/plugin.test.cjs
 
 本地已全面验证 Soloist 冷启动、配对自动恢复、Spotify 曲库浏览、直接队列播控、播放/暂停/拖动进度与音量调节；并已实机验证 MyGo 拉起 Soloist 子进程及音频正常播放。其他操作系统平台或特殊账号配置仍需独立验证。
 
-安装无需发布 Release：MyGo 支持直接从默认分支的最新 Commit 进行安装。本仓库已添加 `mygo-music-plugin` 标签以便被 [MyGo 插件中心](https://mygo-music.egoist.dev/plugins) 自动收录。
+本仓库通过 GitHub Releases 发布正式版本：MyGo Music 在检测到仓库存在 Release 时会自动拉取最新 Release 源码包（无需手动上传二进制附件；若仓库未发布 Release 则拉取默认分支最新 Commit）。从 `v1.1.x` 升级至 `v1.2.0` 时，因新增 macOS 所需的 `bin/soloist` 与 `/bin/sh` 进程权限，MyGo 会提示重新确认权限。本仓库已添加 `mygo-music-plugin` 标签以便被 [MyGo 插件中心](https://mygo-music.egoist.dev/plugins) 自动收录。
 
 ## 开源许可
 
