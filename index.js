@@ -615,14 +615,11 @@ let configPromise = null, startPromise = null, startGeneration = 0, daemon = nul
 let authState = null, playback = null, anchoredAt = 0, backendError = null;
 async function resolveConfig() {
   const directKey = (host.setting?.("soloistApiKey") || "").trim();
-  if (directKey) {
-    const base = String(host.dataDir || "").replace(/[\\/]+$/, "");
-    if (!base) throw problem("setup", "Plugin data directory is unavailable. Restart MyGo Music and try again.");
-    return { key: directKey, dataDir: `${base}/soloist/data`, cacheDir: `${base}/soloist/cache`, source: "setting" };
-  }
+  if (directKey) return { key: directKey, source: "setting" };
   const c = await helper("config");
   return { ...c, source: "dpapi" };
 }
+const dataArgs = c => (c?.dataDir ? ["-D", c.dataDir] : []);
 const config = () => configPromise ||= resolveConfig().catch(e => { configPromise = null; throw e; });
 function stopSoloist() {
   ++startGeneration;
@@ -652,7 +649,7 @@ function positionNow() {
 function anchorPosition() { if (playback) { playback.position = { ...playback.position, position_ms: positionNow() }; anchoredAt = Date.now(); } }
 async function watch(c) {
   if (watcher) return;
-  const p = spawnProcess(EXE, ["ctl", "trace", "-D", c.dataDir]); watcher = p; p.closeStdin();
+  const p = spawnProcess(EXE, ["ctl", "trace", ...dataArgs(c)]); watcher = p; p.closeStdin();
   (async () => {
     try {
       for (let line; (line = await p.readLine()) !== null;) {
@@ -664,7 +661,7 @@ async function watch(c) {
   })().catch(() => {});
 }
 async function ctl(args, timeout) {
-  const c = await config(); const r = await processResult(EXE, ["ctl", ...args, "-D", c.dataDir], timeout);
+  const c = await config(); const r = await processResult(EXE, ["ctl", ...args, ...dataArgs(c)], timeout);
   if (r.code) throw new Error(r.code === 3 ? t("Pair MyGo Soloist from the Spotify app on your phone first.") : t("Soloist could not complete the command. Check the Playback Status page."));
   return r.output;
 }
@@ -677,11 +674,20 @@ async function ensureSoloist() {
     if (host.platform !== "windows") throw problem("setup", "This preview currently supports Windows x64 only.");
     const c = await config();
     if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
-    const status = await processResult(EXE, ["ctl", "status", "-D", c.dataDir], 6000);
+    const statusArgs = ["ctl", "status", ...dataArgs(c)];
+    const status = await processResult(EXE, statusArgs, 6000);
     if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
     if (status.code !== 0 || !/running \(pid/.test(status.output)) {
       authState = null; playback = null; backendError = null;
-      const p = spawnProcess(EXE, ["--device-name", "MyGo Soloist", "--api-key", c.key, "--data-dir", c.dataDir, "--cache-dir", c.cacheDir, "--cache-size", "512", "--ws", "127.0.0.1:0"]);
+      const daemonArgs = [
+        "--device-name", "MyGo Soloist",
+        "--api-key", c.key,
+        ...(c.dataDir ? ["--data-dir", c.dataDir] : []),
+        ...(c.cacheDir ? ["--cache-dir", c.cacheDir] : []),
+        "--cache-size", "512",
+        "--ws", "127.0.0.1:0",
+      ];
+      const p = spawnProcess(EXE, daemonArgs);
       daemon = p; p.closeStdin();
       // Drain stdout so the host's reader never blocks. Do not log credentials.
       (async () => { while (await p.readLine() !== null) {} })().catch(() => {});
@@ -695,7 +701,7 @@ async function ensureSoloist() {
       while (Date.now() < until) {
         if (runId !== startGeneration) { try { p.kill?.(); } catch {} throw new Error(t("Soloist configuration changed. Try again.")); }
         if (backendError) throw backendError;
-        const r = await processResult(EXE, ["ctl", "status", "-D", c.dataDir], 3000);
+        const r = await processResult(EXE, statusArgs, 3000);
         if (r.code === 0 && /running \(pid/.test(r.output)) { started = true; break; }
         await delay(250);
       }

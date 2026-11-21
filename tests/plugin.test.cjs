@@ -228,14 +228,15 @@ test('pure JS PKCE matches RFC 7636 S256 vector and works with or without Web Cr
   }
 });
 
-test('soloistApiKey setting bypasses PowerShell helper and stopSoloist isolates stale processes',async()=>{
+test('soloistApiKey setting bypasses PowerShell helper, reuses Soloist default data dir, and stopSoloist isolates stale processes',async()=>{
   let helperCalls=0,killed=0;
+  const spawnedArgs=[];
   const h=warmupHarness({
     settings:{soloistApiKey:'  my-direct-key  '},
-    dataDir:'C:/Users/me/AppData/Roaming/MyGo Music/plugin-data/spotify-soloist/',
     helperImpl:async()=>{helperCalls++;return {key:'dpapi-key',dataDir:'D:/dpapi',cacheDir:'D:/cache'};},
     processResultImpl:async()=>({code:0,output:'running (pid 55)',error:''}),
-    spawnImpl:()=>{
+    spawnImpl:(prog,args)=>{
+      spawnedArgs.push(args);
       let sent=false,stopRead;
       return {
         closeStdin(){},
@@ -252,10 +253,11 @@ test('soloistApiKey setting bypasses PowerShell helper and stopSoloist isolates 
   assert.equal(helperCalls,0);
   assert.equal(cfg.key,'my-direct-key');
   assert.equal(cfg.source,'setting');
-  assert.equal(cfg.dataDir,'C:/Users/me/AppData/Roaming/MyGo Music/plugin-data/spotify-soloist/soloist/data');
-  assert.equal(cfg.cacheDir,'C:/Users/me/AppData/Roaming/MyGo Music/plugin-data/spotify-soloist/soloist/cache');
+  assert.equal(cfg.dataDir,undefined,'UI key mode must use Soloist default data dir');
+  assert.equal(cfg.cacheDir,undefined,'UI key mode must use Soloist default cache dir');
 
   await h.ensureSoloist();
+  assert.deepEqual(Array.from(spawnedArgs[0]),['ctl','trace']);
   h.stopSoloist();
   assert.equal(killed,1,'stopSoloist must terminate existing watcher');
 });

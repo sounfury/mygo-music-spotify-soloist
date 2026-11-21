@@ -97,9 +97,8 @@ sounfury/mygo-music-spotify-soloist
 | 数据类型 | 本地存储路径 |
 | --- | --- |
 | Spotify Web API 令牌及插件设置（含界面填写的 Key） | MyGo 目录下的 `plugin-data/spotify-soloist` |
-| Soloist 配对凭证与缓存（界面填写 Key 模式） | MyGo 目录下的 `plugin-data/spotify-soloist/soloist/{data,cache}` |
-| 加密的 Soloist Key（可选 DPAPI 脚本模式） | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml` |
-| Soloist 配对凭证与缓存（可选 DPAPI 脚本模式） | `%LOCALAPPDATA%\soloist\{data,cache}` |
+| Soloist 配对凭证与原声音频缓存（两种 Key 模式共用） | `%LOCALAPPDATA%\soloist\{data,cache}` |
+| 加密的 Soloist Key（仅可选 DPAPI 脚本模式） | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml` |
 
 - **多进程互斥**：同一数据目录在同一时间仅支持一个 Soloist 进程访问；只要保留默认路径的数据，已有的配对即可持续复用。在插件中退出 Web API 账号不会影响已建立的 Soloist 设备配对。
 - **安全提示**：虽然本地落盘的 Key 已通过 Windows DPAPI 加密，但受限于 Soloist 当前机制，启动时仍需以命令行参数方式传给进程，因而本地进程监视器可能窥见该参数。请避免公开完整的进程命令行、未脱敏日志或会话目录。Spotify Web API 的访问令牌则安全存储于 MyGo 插件本地存储中。本仓库不包含任何私有 Key 或令牌。

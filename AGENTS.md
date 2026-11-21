@@ -93,7 +93,7 @@
    - `pickBestLyrics()` 优先返回**双语同步歌词**（网易云 → QQ 音乐），无翻译时按 LRCLIB → 网易云 → QQ 音乐回退，结果写入上限 100 首的内存缓存 `lyricsCache`。
 
 4. **Soloist 生命周期、API Key 热切换与播放状态机**
-   - **API Key 双源解析与热切换**：`resolveConfig()` 优先读取插件设置中的 `soloistApiKey`（数据与缓存落盘在 `host.dataDir/soloist/{data,cache}`，零 PowerShell 开销），留空时自动回退到 `soloist-host.ps1 -Action config`（兼容既有 DPAPI 配置）。修改 `soloistApiKey` 时 `setSetting()` 调用 `stopSoloist()` 递增 `startGeneration`、安全回收旧 `watcher`/`daemon` 并立即以新 Key 后台预热。
+   - **API Key 双源解析与热切换**：`resolveConfig()` 优先读取插件设置中的 `soloistApiKey`（零 PowerShell 开销，且不覆写 `-D`/`-C`，直接沿用 Soloist 官方默认目录 `%LOCALAPPDATA%\soloist\{data,cache}`），留空时自动回退到 `soloist-host.ps1 -Action config`（同样指向 `%LOCALAPPDATA%\soloist\{data,cache}`），两种方式完全共享配对凭证与缓存。修改 `soloistApiKey` 时 `setSetting()` 调用 `stopSoloist()` 递增 `startGeneration`、安全回收旧 `watcher`/`daemon` 并立即以新 Key 后台预热。
    - **挂载预热与单飞启动锁**：模块顶层通过 `setTimeout(warmupSoloist, 0)` 在事件循环首个宏任务静默触发 `ensureSoloist()`（登录后也会补触发一次），不执行 `activate`，避免抢占其他设备焦点；`startPromise` 配合 `startGeneration` 确保并发播放复用同一次启动且旧配置启动不会污染新实例，轮询超时时主动清理未响应子进程。
    - **事件驱动状态机**：通过 `soloist.exe ctl trace` 持续消费 JSON 事件流（按 `watcher === p` 隔离旧追踪器），`positionNow()` 基于本地时钟锚点 `anchoredAt` 插值计算进度，避免依赖守护进程挂钟或高频轮询云端。
    - **队列串行化与代际抢占**：`remotePlay()` 通过 `queueJob` 串行执行、通过 `playGeneration` 递增实现“后点覆盖前点”，`remotePause()`、`signOut()` 与 `stopSoloist()` 也会递增代际以取消尚未落地的播控请求。
