@@ -109,23 +109,24 @@ test('lyrics fetches LRCLIB, NetEase and QQ Music concurrently and falls back cl
   assert.equal(trackCalls,1);
 });
 
-function warmupHarness({platform='windows',helperImpl,processResultImpl,spawnImpl}){
+function warmupHarness({platform='windows',settings={},dataDir='D:/plugin-data/spotify-soloist',helperImpl,processResultImpl,spawnImpl}){
   const from=source.indexOf('const EXE = "bin/soloist.exe";'),to=source.indexOf('async function ready()',from);
   const tailFrom=source.indexOf('// Start Soloist in the background');
   assert(from>=0&&to>from&&tailFrom>to);
   const timers=[];
   const code=source.slice(from,to)+'\n'+source.slice(tailFrom);
   const c={
-    Date,Math,Promise,Error,JSON,Object,
-    host:{platform,spawn:spawnImpl},
+    Date,Math,Promise,Error,JSON,Object,String,
+    host:{platform,dataDir,setting:k=>settings[k]||'',spawn:spawnImpl},
     t:s=>s,
     problem:(code,msg)=>Object.assign(new Error(msg),{code}),
     delay:async()=>{},
     helper:helperImpl,
     processResult:processResultImpl,
+    spawnProcess:(prog,args)=>spawnImpl(prog,args),
     setTimeout:(fn,ms)=>{timers.push({fn,ms});return timers.length;},
   };
-  vm.runInNewContext(code+';globalThis.subject={ensureSoloist,warmupSoloist}',c);
+  vm.runInNewContext(code+';globalThis.subject={ensureSoloist,warmupSoloist,resolveConfig,stopSoloist}',c);
   return {...c.subject,timers};
 }
 
@@ -198,4 +199,105 @@ test('mount warmup swallows setup failures without poisoning later retries and s
   mac.timers[0].fn();
   await new Promise(r=>setImmediate(r));
   assert.equal(nonWinCalls,0);
+});
+
+test('pure JS PKCE matches RFC 7636 S256 vector and works with or without Web Crypto',()=>{
+  const from=source.indexOf('// Pure JS PKCE (RFC 7636)'),to=source.indexOf('function spawnProcess(',from);
+  assert(from>=0&&to>from);
+  const code=source.slice(from,to);
+  const run=(withCrypto)=>{
+    const c={Uint8Array,Uint32Array,Math,Date,String};
+    if(withCrypto)c.crypto=globalThis.crypto;
+    vm.runInNewContext(code+';globalThis.subject={sha256Bytes,toBase64Url,createPkce}',c);
+    return c.subject;
+  };
+  const s=run(true);
+  // RFC 7636 Appendix B test vector
+  const rfcVerifier='dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+  assert.equal(s.toBase64Url(s.sha256Bytes(rfcVerifier)),'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM');
+  // NIST SHA-256("abc")
+  const abcHex=Array.from(s.sha256Bytes('abc'),b=>b.toString(16).padStart(2,'0')).join('');
+  assert.equal(abcHex,'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+
+  for(const withCrypto of [true,false]){
+    const inst=run(withCrypto);
+    const pkce=inst.createPkce();
+    assert.match(pkce.verifier,/^[A-Za-z0-9_-]{43,128}$/);
+    assert.match(pkce.state,/^[A-Za-z0-9_-]{32,128}$/);
+    assert.equal(pkce.challenge,inst.toBase64Url(inst.sha256Bytes(pkce.verifier)));
+  }
+});
+
+test('soloistApiKey setting bypasses PowerShell helper and stopSoloist isolates stale processes',async()=>{
+  let helperCalls=0,killed=0;
+  const h=warmupHarness({
+    settings:{soloistApiKey:'  my-direct-key  '},
+    dataDir:'C:/Users/me/AppData/Roaming/MyGo Music/plugin-data/spotify-soloist/',
+    helperImpl:async()=>{helperCalls++;return {key:'dpapi-key',dataDir:'D:/dpapi',cacheDir:'D:/cache'};},
+    processResultImpl:async()=>({code:0,output:'running (pid 55)',error:''}),
+    spawnImpl:()=>{
+      let sent=false,stopRead;
+      return {
+        closeStdin(){},
+        kill(){killed++;stopRead?.(null);},
+        readLine:async()=>{
+          if(!sent){sent=true;return '{"type":"auth_state","logged_in":true,"device_name":"MyGo Soloist","is_active":false}';}
+          return new Promise(r=>{stopRead=r;});
+        },
+        wait:async()=>0,
+      };
+    },
+  });
+  const cfg=await h.resolveConfig();
+  assert.equal(helperCalls,0);
+  assert.equal(cfg.key,'my-direct-key');
+  assert.equal(cfg.source,'setting');
+  assert.equal(cfg.dataDir,'C:/Users/me/AppData/Roaming/MyGo Music/plugin-data/spotify-soloist/soloist/data');
+  assert.equal(cfg.cacheDir,'C:/Users/me/AppData/Roaming/MyGo Music/plugin-data/spotify-soloist/soloist/cache');
+
+  await h.ensureSoloist();
+  h.stopSoloist();
+  assert.equal(killed,1,'stopSoloist must terminate existing watcher');
+});
+
+test('spawnProcess classifies permission vs missing soloist.exe and signOut blocks stale token refresh',async()=>{
+  const from=source.indexOf('const API ='),to=source.indexOf('// --- Catalog Mapping',from);
+  assert(from>=0&&to>from);
+  const code=source.slice(from,to).replaceAll('export async function','async function').replaceAll('export function','function');
+  const store=new Map([['session',{access:'old-access',refresh:'old-refresh',expiresAt:0}]]);
+  let releaseFetch;
+  const fetchGate=new Promise(r=>{releaseFetch=r;});
+  let spawnErr=null;
+  const c={
+    Date,Math,Promise,Error,JSON,Object,String,Uint8Array,Uint32Array,URL,URLSearchParams,AbortController,setTimeout,clearTimeout,
+    playGeneration:0,
+    stopSoloist(){},
+    warmupSoloist(){},
+    host:{
+      dir:'D:/plugin',
+      t:s=>s,
+      setting:k=>k==='clientId'?'cid-1':'',
+      storage:{get:k=>store.get(k),set:(k,v)=>store.set(k,v),remove:k=>store.delete(k)},
+      spawn:()=>{throw spawnErr;},
+    },
+    fetch:async()=>{
+      await fetchGate;
+      return {ok:true,status:200,text:async()=>JSON.stringify({access_token:'stale-new-token',expires_in:3600})};
+    },
+  };
+  vm.runInNewContext(code+';globalThis.subject={spawnProcess,access,signOut}',c);
+
+  spawnErr=new Error('not allowed by permission');
+  assert.throws(()=>c.subject.spawnProcess('bin/soloist.exe',[]),e=>e.code==='setup'&&/Allow Spotify Soloist/.test(e.message));
+
+  spawnErr=new Error('exec: "bin/soloist.exe": executable file not found');
+  assert.throws(()=>c.subject.spawnProcess('bin/soloist.exe',[]),e=>e.code==='setup'&&/bin\/soloist\.exe was not found/.test(e.message));
+
+  // Start token refresh, then signOut before the network response returns.
+  const pending=c.subject.access(true);
+  await Promise.resolve();
+  c.subject.signOut();
+  releaseFetch();
+  await assert.rejects(pending,e=>e.code==='signIn');
+  assert.equal(store.has('session'),false,'stale refresh must not restore signed-out session');
 });

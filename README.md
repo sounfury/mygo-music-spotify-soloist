@@ -56,16 +56,17 @@ sounfury/mygo-music-spotify-soloist
 
 ---
 
-### 2. 保存 Soloist API Key
+### 2. 配置 Soloist API Key
 
 1. 登录 [Spotify Soloist 控制台](https://developer.spotify.com/dashboard/soloist) 获取你的专属 API Key。（注意：**该 API Key 与下一步配置的 Web API Client ID 为两份相互独立的凭据**）。
-2. 若使用默认插件目录，直接在 PowerShell 中运行以下命令：
+2. **推荐方式（直接在 MyGo 设置中填写）**：在 MyGo Music 的 **设置 → 插件 → Spotify Soloist** 中找到 **Soloist API Key** 密码框，直接粘贴保存即可；修改后插件会自动使用新 Key 重启 Soloist，无需运行脚本或手动重启插件。
+3. **可选方式（Windows DPAPI 本地加密脚本）**：若你希望使用 Windows DPAPI 单独加密落盘，可将设置里的 **Soloist API Key** 留空，在 PowerShell 中运行以下命令：
 
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File "$env:APPDATA\MyGo Music\plugins\spotify-soloist\scripts\soloist-host.ps1" -Action setup
    ```
 
-3. 在弹出的隐藏输入提示中粘贴你的 Key 并按下回车。若插件安装在自定义路径，请相应调整脚本路径。脚本会使用 Windows DPAPI 对 Key 进行本地用户级加密存储。**请切勿将 Key 分享给他人或直接粘贴在公开 Issue 中**。
+   在弹出的隐藏输入提示中粘贴你的 Key 并按下回车（自定义插件目录请相应调整路径）。**请切勿将 Key 分享给他人或直接粘贴在公开 Issue 中**。
 
 ---
 
@@ -95,14 +96,14 @@ sounfury/mygo-music-spotify-soloist
 
 | 数据类型 | 本地存储路径 |
 | --- | --- |
-| 加密的 Soloist Key | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml` |
-| Soloist 配对凭证与持久化数据 | `%LOCALAPPDATA%\soloist\data` |
-| Soloist 原声音频缓存 | `%LOCALAPPDATA%\soloist\cache` |
-| Spotify Web API 令牌及插件设置 | MyGo 目录下的 `plugin-data/spotify-soloist` |
+| Spotify Web API 令牌及插件设置（含界面填写的 Key） | MyGo 目录下的 `plugin-data/spotify-soloist` |
+| Soloist 配对凭证与缓存（界面填写 Key 模式） | MyGo 目录下的 `plugin-data/spotify-soloist/soloist/{data,cache}` |
+| 加密的 Soloist Key（可选 DPAPI 脚本模式） | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml` |
+| Soloist 配对凭证与缓存（可选 DPAPI 脚本模式） | `%LOCALAPPDATA%\soloist\{data,cache}` |
 
 - **多进程互斥**：同一数据目录在同一时间仅支持一个 Soloist 进程访问；只要保留默认路径的数据，已有的配对即可持续复用。在插件中退出 Web API 账号不会影响已建立的 Soloist 设备配对。
 - **安全提示**：虽然本地落盘的 Key 已通过 Windows DPAPI 加密，但受限于 Soloist 当前机制，启动时仍需以命令行参数方式传给进程，因而本地进程监视器可能窥见该参数。请避免公开完整的进程命令行、未脱敏日志或会话目录。Spotify Web API 的访问令牌则安全存储于 MyGo 插件本地存储中。本仓库不包含任何私有 Key 或令牌。
-- **系统调用与网络说明**：插件需申请调用 `bin/soloist.exe` 与 `powershell.exe`（用于执行本地 DPAPI 解密与高安全性 PKCE 随机串生成）。Soloist 本地控制端口仅监听 `127.0.0.1` 环回地址并采用动态随机端口。检索双语同步歌词时，会向 LRCLIB（`lrclib.net`）、网易云音乐（`music.163.com`）与 QQ 音乐（`c.y.qq.com`、`u.y.qq.com`）发送曲名、艺术家、专辑与时长等公开元数据。
+- **系统调用与网络说明**：OAuth PKCE 鉴权由纯 JS 在沙盒内完成，登录曲库无需启动外部进程。播放音频时调用 `bin/soloist.exe`；仅在未于插件设置填写 Soloist API Key、回退读取可选 DPAPI 脚本时才会调用 `powershell.exe`。Soloist 本地控制端口仅监听 `127.0.0.1` 环回地址并采用动态随机端口。检索双语同步歌词时，会向 LRCLIB（`lrclib.net`）、网易云音乐（`music.163.com`）与 QQ 音乐（`c.y.qq.com`、`u.y.qq.com`）发送曲名、艺术家、专辑与时长等公开元数据。
 
 ## 已知限制与更新维护
 

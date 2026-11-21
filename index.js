@@ -8,13 +8,133 @@ const t = text => host.t(text);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function problem(code, message) { return Object.assign(new Error(t(message)), { code }); }
 
-async function processResult(program, args, timeout = 15000) {
-  let p;
-  try { p = host.spawn(program, args); }
+// Pure JS PKCE (RFC 7636) with FIPS 180-4 SHA-256 so signIn needs no child process.
+const B64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+function utf8Bytes(text) {
+  const s = String(text || "");
+  const out = [];
+  for (let i = 0; i < s.length; i++) {
+    let cp = s.charCodeAt(i);
+    if (cp >= 0xd800 && cp <= 0xdbff && i + 1 < s.length) {
+      const next = s.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) { cp = 0x10000 + ((cp - 0xd800) << 10) + (next - 0xdc00); i++; }
+    }
+    if (cp < 0x80) out.push(cp);
+    else if (cp < 0x800) out.push(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f));
+    else if (cp < 0x10000) out.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+    else out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+  }
+  return new Uint8Array(out);
+}
+function sha256Bytes(input) {
+  const src = input instanceof Uint8Array ? input : utf8Bytes(input);
+  const len = src.length;
+  const total = ((len + 9 + 63) >> 6) << 6;
+  const msg = new Uint8Array(total);
+  msg.set(src);
+  msg[len] = 0x80;
+  const bitLen = len * 8;
+  const hi = Math.floor(bitLen / 0x100000000) >>> 0;
+  const lo = bitLen >>> 0;
+  msg[total - 8] = (hi >>> 24) & 0xff; msg[total - 7] = (hi >>> 16) & 0xff;
+  msg[total - 6] = (hi >>> 8) & 0xff; msg[total - 5] = hi & 0xff;
+  msg[total - 4] = (lo >>> 24) & 0xff; msg[total - 3] = (lo >>> 16) & 0xff;
+  msg[total - 2] = (lo >>> 8) & 0xff; msg[total - 1] = lo & 0xff;
+  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+  let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+  const w = new Uint32Array(64);
+  for (let off = 0; off < total; off += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = off + i * 4;
+      w[i] = ((msg[j] << 24) | (msg[j + 1] << 16) | (msg[j + 2] << 8) | msg[j + 3]) >>> 0;
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = (((w[i - 15] >>> 7) | (w[i - 15] << 25)) ^ ((w[i - 15] >>> 18) | (w[i - 15] << 14)) ^ (w[i - 15] >>> 3)) >>> 0;
+      const s1 = (((w[i - 2] >>> 17) | (w[i - 2] << 15)) ^ ((w[i - 2] >>> 19) | (w[i - 2] << 13)) ^ (w[i - 2] >>> 10)) >>> 0;
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (let i = 0; i < 64; i++) {
+      const S1 = (((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))) >>> 0;
+      const ch = ((e & f) ^ (~e & g)) >>> 0;
+      const t1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const S0 = (((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))) >>> 0;
+      const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      const t2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0;
+      d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+  }
+  const digest = new Uint8Array(32);
+  const words = [h0, h1, h2, h3, h4, h5, h6, h7];
+  for (let i = 0; i < 8; i++) {
+    digest[i * 4] = (words[i] >>> 24) & 0xff;
+    digest[i * 4 + 1] = (words[i] >>> 16) & 0xff;
+    digest[i * 4 + 2] = (words[i] >>> 8) & 0xff;
+    digest[i * 4 + 3] = words[i] & 0xff;
+  }
+  return digest;
+}
+function toBase64Url(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const has1 = i + 1 < bytes.length;
+    const has2 = i + 2 < bytes.length;
+    const b1 = has1 ? bytes[i + 1] : 0;
+    const b2 = has2 ? bytes[i + 2] : 0;
+    out += B64URL_ALPHABET[b0 >> 2];
+    out += B64URL_ALPHABET[((b0 & 3) << 4) | (b1 >> 4)];
+    if (has1) out += B64URL_ALPHABET[((b1 & 15) << 2) | (b2 >> 6)];
+    if (has2) out += B64URL_ALPHABET[b2 & 63];
+  }
+  return out;
+}
+let entropyCounter = 0;
+function randomBytes(size) {
+  const out = new Uint8Array(size);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    return crypto.getRandomValues(out);
+  }
+  for (let off = 0; off < size; off += 32) {
+    const seed = `${Date.now()}:${++entropyCounter}:${Math.random()}:${Math.random()}:${Math.random()}`;
+    const block = sha256Bytes(seed);
+    out.set(block.subarray(0, Math.min(32, size - off)), off);
+  }
+  return out;
+}
+function createPkce() {
+  const verifier = toBase64Url(randomBytes(48));
+  const state = toBase64Url(randomBytes(32));
+  const challenge = toBase64Url(sha256Bytes(verifier));
+  return { verifier, state, challenge };
+}
+
+function spawnProcess(program, args) {
+  try { return host.spawn(program, args); }
   catch (e) {
-    if (/allowed|permission/i.test(e.message)) throw problem("setup", "Allow Spotify Soloist to start programs in its plugin settings.");
+    const msg = String(e?.message || "");
+    if (/allowed|permission|grant/i.test(msg)) throw problem("setup", "Allow Spotify Soloist to start programs in its plugin settings.");
+    if (/soloist(?:\.exe)?$/i.test(String(program || "")) && /no such file|cannot find|not found|enoent|executable file not found/i.test(msg)) {
+      throw problem("setup", "bin/soloist.exe was not found. Download Spotify Soloist and place it in the plugin's bin folder.");
+    }
     throw problem("setup", "Could not start the Soloist helper. Reinstall this plugin and its local Soloist executable.");
   }
+}
+async function processResult(program, args, timeout = 15000) {
+  const p = spawnProcess(program, args);
   p.closeStdin();
   let expired = false;
   const timer = setTimeout(() => { expired = true; p.kill(); }, timeout);
@@ -28,7 +148,7 @@ async function processResult(program, args, timeout = 15000) {
 }
 async function helper(action) {
   const r = await processResult("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `${host.dir}/scripts/soloist-host.ps1`, "-Action", action]);
-  if (r.code !== 0) throw problem("setup", "Save your Soloist API key with the local setup script first.");
+  if (r.code !== 0) throw problem("setup", "Enter your Soloist API Key in the plugin settings, or save it with scripts/soloist-host.ps1.");
   try { return JSON.parse(r.output); } catch { throw new Error(t("The Soloist helper returned an invalid response.")); }
 }
 function clientId() {
@@ -43,29 +163,41 @@ async function timedFetch(url, options, deadline = Date.now() + 8000) {
     const response = await fetch(url, { ...options, signal: abort.signal });
     const text = await response.text();
     return { response, text };
+  } catch (e) {
+    if (abort.signal.aborted || e?.name === "AbortError") throw Object.assign(new Error(t("Spotify request timed out. Try again.")), { code: "timeout" });
+    throw e;
   } finally { clearTimeout(timer); }
 }
-async function tokens(params) {
+let authGeneration = 0;
+let refreshing = null;
+async function tokens(params, generation = authGeneration) {
   const { response: r, text } = await timedFetch(`${AUTH}/api/token`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: clientId(), ...params }).toString() });
-  let value; try { value = JSON.parse(text); } catch { throw new Error("Invalid Spotify authorization response"); }
+  let value; try { value = JSON.parse(text); } catch { throw new Error(t("Invalid Spotify authorization response. Sign in again.")); }
   if (!r.ok) {
-    if (value.error === "invalid_grant") host.storage.remove("session");
+    if (value.error === "invalid_grant" && generation === authGeneration) host.storage.remove("session");
     throw problem("signIn", "Spotify authorization expired or was refused. Sign in again.");
   }
   return value;
 }
-function saveTokens(value, previous = {}) {
+function saveTokens(value, previous = {}, generation = authGeneration) {
+  if (generation !== authGeneration) throw problem("signIn", "Sign in to Spotify to load your music library.");
   const session = { access: value.access_token, refresh: value.refresh_token || previous.refresh, expiresAt: Date.now() + value.expires_in * 1000 };
   host.storage.set("session", session);
   return session;
 }
-let refreshing = null;
 async function access(force = false) {
+  const generation = authGeneration;
   let s = host.storage.get("session");
   if (!s) throw problem("signIn", "Sign in to Spotify to load your music library.");
   if (force || s.expiresAt < Date.now() + 60000) {
-    if (!refreshing) refreshing = tokens({ grant_type: "refresh_token", refresh_token: s.refresh }).then(v => saveTokens(v, s)).finally(() => { refreshing = null; });
-    s = await refreshing;
+    if (!refreshing || refreshing.generation !== generation) {
+      const pending = tokens({ grant_type: "refresh_token", refresh_token: s.refresh }, generation)
+        .then(v => saveTokens(v, s, generation))
+        .finally(() => { if (refreshing?.promise === pending) refreshing = null; });
+      refreshing = { generation, promise: pending };
+    }
+    s = await refreshing.promise;
+    if (generation !== authGeneration) throw problem("signIn", "Sign in to Spotify to load your music library.");
   }
   return s.access;
 }
@@ -73,6 +205,7 @@ async function api(method, path, body, query, deadline = Date.now() + 12000) {
   const url = new URL(path.startsWith("https://") ? path : API + path);
   if (url.origin !== "https://api.spotify.com") throw new Error("Unexpected Spotify API origin");
   for (const [key, value] of Object.entries(query || {})) if (value !== undefined) url.searchParams.set(key, String(value));
+  const generation = authGeneration;
   let r, text;
   for (let attempt = 0; attempt < 2; attempt++) {
     const token = await access(attempt > 0);
@@ -83,7 +216,8 @@ async function api(method, path, body, query, deadline = Date.now() + 12000) {
   }
   let data; try { data = text ? JSON.parse(text) : null; } catch { data = null; }
   if (!r.ok) {
-    if (r.status === 401) { host.storage.remove("session"); throw problem("signIn", "Sign in to Spotify again."); }
+    if (r.status === 401) { if (generation === authGeneration) host.storage.remove("session"); throw problem("signIn", "Sign in to Spotify again."); }
+    if (r.status === 403 && data?.error?.reason === "PREMIUM_REQUIRED") throw new Error(t("A Spotify Premium account is required for playback control."));
     if (r.status === 429) throw new Error(t("Spotify is limiting requests. Try again later."));
     const e = new Error(data?.error?.message || `Spotify HTTP ${r.status}`); e.status = r.status; throw e;
   }
@@ -91,18 +225,32 @@ async function api(method, path, body, query, deadline = Date.now() + 12000) {
 }
 export async function signIn() {
   const id = clientId();
-  const pkce = await helper("pkce");
+  const pkce = createPkce();
   const back = host.waitForRedirect({ port: 43110, path: "/callback", timeout: 180000, page: "Signed in to Spotify Soloist. You can close this page." });
   host.signInPrompt({ text: t("Approve Spotify library access in your browser. Soloist pairing is separate.") });
   host.openURL(`${AUTH}/authorize?${new URLSearchParams({ client_id: id, response_type: "code", redirect_uri: REDIRECT, scope: SCOPES, state: pkce.state, code_challenge_method: "S256", code_challenge: pkce.challenge })}`);
   const answer = await back;
   if (answer.state !== pkce.state || !answer.code) throw new Error(t("Spotify sign-in was cancelled or could not be verified."));
-  saveTokens(await tokens({ grant_type: "authorization_code", code: answer.code, redirect_uri: REDIRECT, code_verifier: pkce.verifier }));
+  const generation = ++authGeneration;
+  refreshing = null;
+  saveTokens(await tokens({ grant_type: "authorization_code", code: answer.code, redirect_uri: REDIRECT, code_verifier: pkce.verifier }, generation), {}, generation);
   warmupSoloist();
   return account();
 }
-export function signOut() { host.storage.remove("session"); host.storage.remove("me"); }
-export function setSetting({ key }) { if (key === "clientId") signOut(); }
+export function signOut() {
+  ++authGeneration;
+  ++playGeneration;
+  refreshing = null;
+  host.storage.remove("session");
+  host.storage.remove("me");
+}
+export function setSetting({ key, value }) {
+  if (key === "clientId") signOut();
+  if (key === "soloistApiKey") {
+    stopSoloist();
+    if (String(value || "").trim()) warmupSoloist();
+  }
+}
 export async function account() {
   if (!host.storage.get("session")) return null;
   const me = await api("GET", "/me"); host.storage.set("me", me.id);
@@ -421,9 +569,27 @@ export async function lyrics({ id }) {
 
 // The desktop app owns these child processes; MyGo hides their Windows consoles.
 const EXE = "bin/soloist.exe";
-let configPromise = null, startPromise = null, daemon = null, watcher = null;
+let configPromise = null, startPromise = null, startGeneration = 0, daemon = null, watcher = null;
 let authState = null, playback = null, anchoredAt = 0, backendError = null;
-const config = () => configPromise ||= helper("config").catch(e => { configPromise = null; throw e; });
+async function resolveConfig() {
+  const directKey = (host.setting?.("soloistApiKey") || "").trim();
+  if (directKey) {
+    const base = String(host.dataDir || "").replace(/[\\/]+$/, "");
+    if (!base) throw problem("setup", "Plugin data directory is unavailable. Restart MyGo Music and try again.");
+    return { key: directKey, dataDir: `${base}/soloist/data`, cacheDir: `${base}/soloist/cache`, source: "setting" };
+  }
+  const c = await helper("config");
+  return { ...c, source: "dpapi" };
+}
+const config = () => configPromise ||= resolveConfig().catch(e => { configPromise = null; throw e; });
+function stopSoloist() {
+  ++startGeneration;
+  if (typeof playGeneration === "number") ++playGeneration;
+  const oldWatcher = watcher, oldDaemon = daemon;
+  startPromise = null; watcher = null; daemon = null; authState = null; playback = null; anchoredAt = 0; backendError = null; configPromise = null;
+  try { oldWatcher?.kill?.(); } catch {}
+  try { oldDaemon?.kill?.(); } catch {}
+}
 function onEvent(e) {
   switch (e.type) {
     case "auth_state": authState = e; if (!e.logged_in) playback = null; break;
@@ -444,10 +610,11 @@ function positionNow() {
 function anchorPosition() { if (playback) { playback.position = { ...playback.position, position_ms: positionNow() }; anchoredAt = Date.now(); } }
 async function watch(c) {
   if (watcher) return;
-  const p = host.spawn(EXE, ["ctl", "trace", "-D", c.dataDir]); watcher = p; p.closeStdin();
+  const p = spawnProcess(EXE, ["ctl", "trace", "-D", c.dataDir]); watcher = p; p.closeStdin();
   (async () => {
     try {
       for (let line; (line = await p.readLine()) !== null;) {
+        if (watcher !== p) break;
         const at = line.indexOf("{"); if (at < 0) continue;
         try { onEvent(JSON.parse(line.slice(at))); } catch {}
       }
@@ -462,14 +629,17 @@ async function ctl(args, timeout) {
 async function ensureSoloist() {
   if (watcher && authState) return authState;
   if (startPromise) return startPromise;
-  startPromise = (async () => {
+  const runId = startGeneration;
+  const promise = (async () => {
     backendError = null;
     if (host.platform !== "windows") throw problem("setup", "This preview currently supports Windows x64 only.");
     const c = await config();
+    if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
     const status = await processResult(EXE, ["ctl", "status", "-D", c.dataDir], 6000);
+    if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
     if (status.code !== 0 || !/running \(pid/.test(status.output)) {
       authState = null; playback = null; backendError = null;
-      const p = host.spawn(EXE, ["--device-name", "MyGo Soloist", "--api-key", c.key, "--data-dir", c.dataDir, "--cache-dir", c.cacheDir, "--cache-size", "512", "--ws", "127.0.0.1:0"]);
+      const p = spawnProcess(EXE, ["--device-name", "MyGo Soloist", "--api-key", c.key, "--data-dir", c.dataDir, "--cache-dir", c.cacheDir, "--cache-size", "512", "--ws", "127.0.0.1:0"]);
       daemon = p; p.closeStdin();
       // Drain stdout so the host's reader never blocks. Do not log credentials.
       (async () => { while (await p.readLine() !== null) {} })().catch(() => {});
@@ -478,24 +648,34 @@ async function ensureSoloist() {
         daemon = null; authState = null; playback = null;
         backendError = code === 10 ? problem("setup", "Soloist expired. Download a new Windows build from Spotify.") : new Error(t("Soloist stopped. Check its installation, API key and pairing."));
       });
+      let started = false;
       const until = Date.now() + 10000;
       while (Date.now() < until) {
+        if (runId !== startGeneration) { try { p.kill?.(); } catch {} throw new Error(t("Soloist configuration changed. Try again.")); }
         if (backendError) throw backendError;
         const r = await processResult(EXE, ["ctl", "status", "-D", c.dataDir], 3000);
-        if (r.code === 0 && /running \(pid/.test(r.output)) break;
+        if (r.code === 0 && /running \(pid/.test(r.output)) { started = true; break; }
         await delay(250);
+      }
+      if (!started) {
+        if (daemon === p) daemon = null;
+        try { p.kill?.(); } catch {}
+        throw new Error(t("Soloist started but did not respond in time. Check your API key and local firewall."));
       }
     }
     const until = Date.now() + 10000;
     while (!authState && Date.now() < until && !backendError) {
+      if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
       if (!watcher) await watch(c);
       await delay(200);
     }
+    if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
     if (backendError) throw backendError;
     if (!authState) throw new Error(t("Soloist did not provide its local connection state."));
     return authState;
-  })().finally(() => { startPromise = null; });
-  return startPromise;
+  })().finally(() => { if (startPromise === promise) startPromise = null; });
+  startPromise = promise;
+  return promise;
 }
 function warmupSoloist() {
   if (typeof host === "undefined" || host.platform !== "windows") return;

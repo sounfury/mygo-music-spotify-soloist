@@ -1,4 +1,4 @@
-param([ValidateSet('config','pkce','setup')][string]$Action = 'config')
+param([ValidateSet('config','setup')][string]$Action = 'config')
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $secretRoot = Join-Path $env:LOCALAPPDATA 'MyGoSoloist'
@@ -11,19 +11,6 @@ try {
         $secret | ConvertFrom-SecureString | Set-Content -LiteralPath $keyFile -Encoding UTF8
         $secret.Dispose()
         Write-Host 'Saved for this Windows user. Restart the plugin, then play a song.'
-        exit 0
-    }
-    if ($Action -eq 'pkce') {
-        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-        $bytes = New-Object byte[] 48
-        $rng.GetBytes($bytes)
-        $verifier = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
-        $rng.GetBytes($bytes)
-        $state = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
-        $sha = [Security.Cryptography.SHA256]::Create()
-        $challenge = [Convert]::ToBase64String($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($verifier))).TrimEnd('=').Replace('+','-').Replace('/','_')
-        $rng.Dispose(); $sha.Dispose()
-        @{verifier=$verifier;challenge=$challenge;state=$state} | ConvertTo-Json -Compress
         exit 0
     }
     if (!(Test-Path -LiteralPath $keyFile)) { throw 'Run scripts/soloist-host.ps1 -Action setup to save your Soloist API key first.' }

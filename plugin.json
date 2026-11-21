@@ -23,8 +23,15 @@
     {
       "key": "clientId",
       "label": "Client ID",
-      "help": "Your Spotify Web API app Client ID. Add http://127.0.0.1:43110/callback as its redirect URI. Soloist API key setup is separate.",
+      "help": "Your Spotify Web API app Client ID. Add http://127.0.0.1:43110/callback as its redirect URI.",
       "link": "https://developer.spotify.com/dashboard"
+    },
+    {
+      "key": "soloistApiKey",
+      "label": "Soloist API Key",
+      "type": "password",
+      "help": "Your personal Soloist API key (separate from Client ID). Optional if already saved via scripts/soloist-host.ps1.",
+      "link": "https://developer.spotify.com/dashboard/soloist"
     }
   ],
   "navigation": [

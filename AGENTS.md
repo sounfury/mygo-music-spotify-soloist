@@ -11,7 +11,7 @@
 - 本插件采用 **双通道官方方案**：
   - **曲库与元数据**：通过 **Spotify Web API**（OAuth 2.0 PKCE，无需 Client Secret）浏览首页、搜索、歌单、专辑、歌手与收藏。
   - **音频拉取、解码与输出**：由 Spotify 官方独立播放核心 **[Soloist](https://developer.spotify.com/documentation/soloist)**（本地 `bin/soloist.exe`）完成，原声无二次转码，不替代音源。
-- **双凭据隔离**：Web API 使用用户自建 Spotify App 的 `Client ID`；Soloist 使用独立的 `Soloist API Key`（通过 Windows DPAPI 加密存储在 `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml`）。本仓库不分发 Soloist 二进制文件，也不包含任何凭据。
+- **双凭据隔离**：Web API 使用用户自建 Spotify App 的 `Client ID`；Soloist 使用独立的 `Soloist API Key`（可直接在 MyGo 插件设置密码框中填写，也可通过 Windows DPAPI 脚本加密存储在 `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml`，前者优先且无需启动 PowerShell）。本仓库不分发 Soloist 二进制文件，也不包含任何凭据。
 
 ---
 
@@ -34,7 +34,7 @@
 | :--- | :--- |
 | `plugin.json` | 插件清单：ID、入口、远程播放模式（`"playback": "remote"`）、网络与进程权限、设置项与侧边栏导航 |
 | `index.js` | 插件完整核心逻辑（单文件 ESM），导出 MyGo `music.Source` 约定的所有方法 |
-| `scripts/soloist-host.ps1` | Windows 本地辅助脚本：`setup`（DPAPI 加密保存 API Key）、`config`（解密输出配置）、`pkce`（生成 PKCE 随机串与 S256 challenge） |
+| `scripts/soloist-host.ps1` | 可选的 Windows DPAPI 辅助脚本：`setup`（DPAPI 加密保存 API Key）与 `config`（解密输出配置，供未在插件设置中直填 Key 时回退） |
 | `locales/zh-CN.json` | 简体中文文案映射表，对应 `plugin.json` 与 `index.js` 中所有 `host.t(...)` / `problem(...)` 文本 |
 | `tests/plugin.test.cjs` | 零依赖 Node.js 回归测试，通过 `node:vm` 模拟宿主环境测试核心逻辑 |
 | `bin/.gitkeep` | 占位文件，提示用户将自行下载的 `soloist.exe` 放入 `bin/`（`.gitignore` 已忽略二进制） |
@@ -74,9 +74,9 @@
 ### 关键模块设计
 
 1. **认证与 API 封装（`index.js` 顶部）**
-   - `signIn()` 借助 `soloist-host.ps1 -Action pkce` 与 `host.waitForRedirect` 在 `127.0.0.1:43110/callback` 完成授权码交换。
-   - `access()` 使用模块级 `refreshing` Promise 合并并发的 Token 刷新请求；`api()` 遇到 `401` 自动强制刷新并重试一次，遇到 `429` 或超时返回用户可读错误。
-   - 使用 `problem(code, message)` 附带标准错误码（`setup` / `signIn`）供 MyGo UI 弹出对应引导。
+   - `createPkce()` 采用**纯 JS 实现 RFC 7636 PKCE + FIPS 180-4 SHA-256**（优先 `crypto.getRandomValues`，无 Web Crypto 时使用哈希白化熵回退），登录完全不依赖子进程；`signIn()` 配合 `host.waitForRedirect` 在 `127.0.0.1:43110/callback` 完成授权码交换。
+   - `access()` 使用 `authGeneration` 代际隔离与单飞 `refreshing` 合并并发 Token 刷新，确保退出登录或更换 `Client ID` 后，进行中的旧刷新不会把旧凭据写回 `host.storage`；`api()` 自动处理 `401` 刷新重试、`403 PREMIUM_REQUIRED`、`429` 限流与请求超时。
+   - `spawnProcess()` 统一拦截并分类进程启动异常（未授权进程权限、缺少 `bin/soloist.exe`、通用启动失败），均通过 `problem(code, message)` 返回带 `setup`/`signIn` 错误码的本地化提示。
 
 2. **曲库接口（Catalog Endpoints）**
    - 统一通过 `track()` / `albumMap()` / `artistMap()` / `playlistMap()` 映射为 MyGo 数据结构。
@@ -91,11 +91,11 @@
    - `pickBestSong()` 基于清洗后的歌名、±3 秒时长容差、歌手匹配度及版本标签惩罚（`Live`/`Remix`/`伴奏`/`翻唱`）打分选曲。
    - `pickBestLyrics()` 优先返回**双语同步歌词**（网易云 → QQ 音乐），无翻译时按 LRCLIB → 网易云 → QQ 音乐回退，结果写入上限 100 首的内存缓存 `lyricsCache`。
 
-4. **Soloist 生命周期、挂载预热与播放状态机**
-   - **挂载预热**：模块顶层通过 `setTimeout(warmupSoloist, 0)` 在事件循环首个宏任务静默触发 `ensureSoloist()`（登录后 `signIn()` 也会补触发一次）。仅拉起守护进程与状态监听，**不执行 `activate`**，避免抢占用户在其他设备的播放焦点；未配置 Key 或未授权时静默吞错，不影响后续显式重试。
-   - **单飞启动锁**：`ensureSoloist()` 通过 `startPromise` 保证预热与并发播放请求共享同一次启动，不会重复拉起 `soloist.exe`。
-   - **事件驱动状态机**：通过 `soloist.exe ctl trace` 持续消费 JSON 事件流（`auth_state`、`playback_state`、`track_changed`、`playback_changed`、`position_sync`、`volume_changed`、`device_changed`），`positionNow()` 基于本地时钟锚点 `anchoredAt` 插值计算进度，避免依赖守护进程挂钟或高频轮询云端。
-   - **队列串行化与代际抢占**：`remotePlay()` 通过 `queueJob` 串行执行、通过 `playGeneration` 递增实现“后点覆盖前点”，`remotePause()` 也会递增代际以取消尚未落地的切歌请求。
+4. **Soloist 生命周期、API Key 热切换与播放状态机**
+   - **API Key 双源解析与热切换**：`resolveConfig()` 优先读取插件设置中的 `soloistApiKey`（数据与缓存落盘在 `host.dataDir/soloist/{data,cache}`，零 PowerShell 开销），留空时自动回退到 `soloist-host.ps1 -Action config`（兼容既有 DPAPI 配置）。修改 `soloistApiKey` 时 `setSetting()` 调用 `stopSoloist()` 递增 `startGeneration`、安全回收旧 `watcher`/`daemon` 并立即以新 Key 后台预热。
+   - **挂载预热与单飞启动锁**：模块顶层通过 `setTimeout(warmupSoloist, 0)` 在事件循环首个宏任务静默触发 `ensureSoloist()`（登录后也会补触发一次），不执行 `activate`，避免抢占其他设备焦点；`startPromise` 配合 `startGeneration` 确保并发播放复用同一次启动且旧配置启动不会污染新实例，轮询超时时主动清理未响应子进程。
+   - **事件驱动状态机**：通过 `soloist.exe ctl trace` 持续消费 JSON 事件流（按 `watcher === p` 隔离旧追踪器），`positionNow()` 基于本地时钟锚点 `anchoredAt` 插值计算进度，避免依赖守护进程挂钟或高频轮询云端。
+   - **队列串行化与代际抢占**：`remotePlay()` 通过 `queueJob` 串行执行、通过 `playGeneration` 递增实现“后点覆盖前点”，`remotePause()`、`signOut()` 与 `stopSoloist()` 也会递增代际以取消尚未落地的播控请求。
 
 ---
 
@@ -106,7 +106,7 @@
 node --check index.js
 node --test tests/plugin.test.cjs
 ```
-当前单测覆盖：本地进度插值与事件状态机、队列代际抢占与暂停取消、艺人页分页与权限降级、歌词解码清洗与候选打分、三源并发与缓存、挂载后台预热与并发去重。
+当前单测覆盖：本地进度插值与事件状态机、队列代际抢占与暂停取消、艺人页分页与权限降级、歌词解码清洗与候选打分、三源并发与缓存、挂载后台预热与并发去重、纯 JS PKCE（RFC 7636/NIST 向量）、API Key UI 直填与热切换隔离、`spawnProcess` 错误分类以及 `signOut` 刷新代际隔离。
 
 ### 修改检查清单
 - **保持单测锚点**：`tests/plugin.test.cjs` 通过字符串定位从 `index.js` 切片在 `node:vm` 中执行（依赖 `const image = items =>`、`export async function liked(`、`const LYRIC_TIMEOUT =`、`// The desktop app owns these child processes`、`const EXE = "bin/soloist.exe";`、`function onEvent(`、`async function watch(`、`async function ready()`、`let queueJob = Promise.resolve();`、`export async function remoteResume()`、`// Start Soloist in the background`）。调整结构时同步确认测试通过。

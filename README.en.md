@@ -56,16 +56,17 @@ On a default Windows installation, the destination path is:
 
 ---
 
-### 2. Save your personal Soloist API key
+### 2. Configure your personal Soloist API key
 
 1. Generate your personal API key from the [Spotify Soloist dashboard](https://developer.spotify.com/dashboard/soloist). (Note: **This key is distinct from the Web API Client ID in the next step**).
-2. If using the default plugin directory, run the following command in PowerShell:
+2. **Recommended (directly in MyGo settings)**: Open **Settings → Plugins → Spotify Soloist**, paste your key into the masked **Soloist API Key** field, and save. Updating the key automatically restarts Soloist in the background—no PowerShell script or manual plugin reload required.
+3. **Optional (Windows DPAPI script)**: If you prefer Windows DPAPI-encrypted storage outside MyGo's settings, leave **Soloist API Key** blank and run:
 
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File "$env:APPDATA\MyGo Music\plugins\spotify-soloist\scripts\soloist-host.ps1" -Action setup
    ```
 
-3. Paste your key into the masked prompt and press Enter. If your plugin is installed in a custom location, adjust the script path accordingly. The script encrypts and stores the key using Windows DPAPI for the current Windows user. **Never share this key with others or post it in public issues.**
+   Paste your key into the masked prompt and press Enter (adjust the path if your plugin is installed in a custom directory). **Never share this key with others or post it in public issues.**
 
 ---
 
@@ -95,14 +96,14 @@ On a default Windows installation, the destination path is:
 
 | Data | Storage Location |
 | --- | --- |
-| Encrypted Soloist Key | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml` |
-| Soloist pairing & persistent state | `%LOCALAPPDATA%\soloist\data` |
-| Soloist audio cache | `%LOCALAPPDATA%\soloist\cache` |
-| Spotify Web API tokens & plugin settings | MyGo's `plugin-data/spotify-soloist` directory |
+| Spotify Web API tokens & plugin settings (including UI-configured key) | MyGo's `plugin-data/spotify-soloist` directory |
+| Soloist pairing & cache (UI-configured key mode) | MyGo's `plugin-data/spotify-soloist/soloist/{data,cache}` |
+| Encrypted Soloist Key (optional DPAPI script mode) | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml` |
+| Soloist pairing & cache (optional DPAPI script mode) | `%LOCALAPPDATA%\soloist\{data,cache}` |
 
 - **Process Isolation**: Only one Soloist process may access the data directory at a time. Existing pairings in the default location are preserved and reused. Signing out of the Web API account does not erase the separate Soloist device pairing.
 - **Security Notice**: While the stored key is encrypted via Windows DPAPI, Soloist currently requires the key to be passed via process command-line arguments, meaning local process monitoring tools may observe it. Avoid sharing raw command-line invocations, unredacted logs, or session folders. Spotify Web API tokens are securely stored in MyGo's local plugin storage. No user credentials or API keys are bundled with this repository.
-- **System Invocation & Network**: The plugin requests permission to execute `bin/soloist.exe` and `powershell.exe` (used for local DPAPI access and cryptographically secure PKCE generation). Soloist binds its local control interface strictly to `127.0.0.1` using an automatically assigned port. When fetching bilingual synchronized lyrics, only public track metadata (title, artist, album, and duration) is sent to LRCLIB (`lrclib.net`), NetEase Cloud Music (`music.163.com`), and QQ Music (`c.y.qq.com`, `u.y.qq.com`).
+- **System Invocation & Network**: OAuth PKCE runs in pure JavaScript inside the plugin sandbox, so signing in to your library requires no child process. `bin/soloist.exe` is spawned for audio playback, and `powershell.exe` is only invoked if **Soloist API Key** is left blank in plugin settings and the optional DPAPI script is used. Soloist binds its local control interface strictly to `127.0.0.1` using an automatically assigned port. When fetching bilingual synchronized lyrics, only public track metadata (title, artist, album, and duration) is sent to LRCLIB (`lrclib.net`), NetEase Cloud Music (`music.163.com`), and QQ Music (`c.y.qq.com`, `u.y.qq.com`).
 
 ## Limitations & Updates
 
