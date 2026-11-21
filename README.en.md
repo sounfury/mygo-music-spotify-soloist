@@ -84,7 +84,7 @@ sounfury/mygo-music-spotify-soloist
 ### 4. Pair once, then play in MyGo
 
 1. Switch the music source in MyGo Music to **Spotify Soloist**. The plugin automatically warms up the background Soloist engine on mount (you can also click any song or open the **Playback Status** page to inspect connection status).
-2. **Initial Pairing**: Ensure your computer and smartphone are connected to the same local area network (LAN/Wi-Fi). Open the official Spotify app on your phone, open the device picker, and select **MyGo Soloist**. Soloist saves the session and will automatically reconnect on subsequent runs. You can then use MyGo for playback without keeping the official desktop client running.
+2. **Initial Pairing**: Ensure your computer and smartphone are connected to the same local area network (LAN/Wi-Fi). Open the official Spotify app on your phone, open the device picker, and select **MyGo Soloist (Windows)** on Windows or **MyGo Soloist (macOS)** on macOS (named per platform so multi-machine setups stay distinguishable). Soloist saves the session and will automatically reconnect on subsequent runs. You can then use MyGo for playback without keeping the official desktop client running.
 3. **Process Lifecycle**: When started by this plugin, Soloist runs silently without console windows. Quitting MyGo or disabling the plugin automatically terminates these child processes. If you already started Soloist manually with its local API enabled, the plugin can attach to it without terminating your manual process.
 
 ## Data & Permissions
@@ -112,7 +112,7 @@ sounfury/mygo-music-spotify-soloist
 
 - **Cannot start helper program**: Verify that `bin/soloist.exe` (Windows) or `bin/soloist` (macOS) exists in the plugin directory and ensure "Allow program execution" is checked in MyGo's plugin settings. On macOS, if manually downloaded and blocked by Gatekeeper, run `chmod +x` and `xattr -d com.apple.quarantine` on `bin/soloist`.
 - **Prompted to save Soloist API key first**: Entering your key directly in **Soloist API Key** in plugin settings is recommended. If using the optional helper script, run the setup command under the same OS user account running MyGo.
-- **Waiting for pairing / endless connection attempt**: Ensure your phone and PC are on the exact same local Wi-Fi / LAN subnet. Try selecting `MyGo Soloist` in the mobile Spotify app's device list. Multiple network adapters, virtual VPN interfaces, or strict firewall policies can disrupt multicast discovery.
+- **Waiting for pairing / endless connection attempt**: Ensure your phone and PC are on the exact same local Wi-Fi / LAN subnet. Try selecting `MyGo Soloist (Windows)` or `MyGo Soloist (macOS)` in the mobile Spotify app's device list. Multiple network adapters, virtual VPN interfaces, or strict firewall policies can disrupt multicast discovery.
 - **Paired but device is not visible to this account**: Verify that both the plugin Web API sign-in and the mobile Spotify app use the identical Spotify account. Allow a few seconds after cold boot for device registration.
 - **Playback volume is low or inaudible**: Soloist device volume and the master system output volume (plus the Windows volume mixer slider for MyGo, or the default Core Audio output device on macOS) each take effect independently. Check them all.
 - **Instance already running**: If you previously launched Soloist manually, stop the manual process before letting the plugin manage it. Keeping the default data directory preserves your existing pairing.

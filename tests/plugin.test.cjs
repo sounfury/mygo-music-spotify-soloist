@@ -926,6 +926,7 @@ test('ensureSoloist automatically downloads missing bin/soloist.exe and self-hea
     },
     spawnImpl:(prog,args)=>{
       if(args[0]==='--device-name'){
+        assert.equal(args[1],'MyGo Soloist (Windows)');
         const shouldExpire=expired;
         return {
           closeStdin(){},
@@ -1091,6 +1092,7 @@ test('macOS Apple Silicon uses bin/soloist, parses macOS versions, auto-download
     spawnImpl:(prog,args)=>{
       spawnedPrograms.push({prog,args:Array.from(args)});
       if(args[0]==='--device-name'){
+        assert.equal(args[1],'MyGo Soloist (macOS)');
         const shouldExpire=expired;
         return {closeStdin(){},kill(){},readLine:async()=>null,wait:async()=>shouldExpire?10:new Promise(()=>{})};
       }

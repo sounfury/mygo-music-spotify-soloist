@@ -84,7 +84,7 @@ sounfury/mygo-music-spotify-soloist
 ### 4. 首次配对，之后在 MyGo 中随心播放
 
 1. 将 MyGo Music 的音乐来源切换为 **Spotify Soloist**，插件挂载后会在后台自动静默预热拉起 Soloist 播放引擎（你也可以直接点击歌曲或打开 **播放状态** 页面查看当前连接状态）。
-2. **首次使用配对**：请确保手机与电脑处于同一局域网下，打开手机端官方 Spotify App，在「可用设备」列表中点选 **MyGo Soloist**。配对成功后 Soloist 会在本地保存凭证，后续启动均会自动恢复连接。此后即可直接在 MyGo 中进行完整播放控制，无需常驻 Spotify 官方桌面客户端。
+2. **首次使用配对**：请确保手机与电脑处于同一局域网下，打开手机端官方 Spotify App，在「可用设备」列表中点选对应平台的设备名——Windows 为 **MyGo Soloist (Windows)**，macOS 为 **MyGo Soloist (macOS)**（按平台区分，避免多台设备同名混淆）。配对成功后 Soloist 会在本地保存凭证，后续启动均会自动恢复连接。此后即可直接在 MyGo 中进行完整播放控制，无需常驻 Spotify 官方桌面客户端。
 3. **进程生命周期**：由插件启动的 Soloist 进程为静默运行；退出 MyGo 或卸载插件时会自动结束相关子进程。若你在启动 MyGo 前已手动运行了带有本地 API 的 Soloist 实例，插件亦可直接附着连接，且不会在退出时强制结束该手动进程。
 
 ## 数据与权限说明
@@ -112,7 +112,7 @@ sounfury/mygo-music-spotify-soloist
 
 - **无法启动辅助程序**：请检查 `bin/soloist.exe`（Windows）或 `bin/soloist`（macOS）是否放置在正确位置，并确认已在 MyGo 插件设置中允许该插件启动外部程序。macOS 手动下载后如遇系统拦截，可对 `bin/soloist` 执行 `chmod +x` 及 `xattr -d com.apple.quarantine`。
 - **提示先保存 API Key**：推荐直接在插件设置的 **Soloist API Key** 中填写；如使用可选脚本模式，请以与启动 MyGo Music 相同的系统用户执行对应平台的 setup 命令。
-- **提示等待配对或一直卡在正在连接**：请确保手机与电脑在同一局域网（同一 Wi-Fi 或子网），并在手机官方 Spotify App 的设备列表中选择 `MyGo Soloist`。多虚拟网卡、VPN 代理或严格的防火墙规则可能会阻碍局域网设备组播发现。
+- **提示等待配对或一直卡在正在连接**：请确保手机与电脑在同一局域网（同一 Wi-Fi 或子网），并在手机官方 Spotify App 的设备列表中选择 `MyGo Soloist (Windows)` 或 `MyGo Soloist (macOS)`。多虚拟网卡、VPN 代理或严格的防火墙规则可能会阻碍局域网设备组播发现。
 - **已成功配对但当前账号找不到设备**：插件绑定的 Web API 账号与手机端登录的 Spotify 账号必须为同一账号；此外冷启动后设备注册到云端可能需要数秒缓冲。
 - **声音过小或无声**：Soloist 设备音量、系统输出设备主音量（Windows 上还包括音量合成器中的 MyGo 音量，macOS 上请检查系统默认 Core Audio 输出设备）各自独立生效，请依次排查。
 - **已有实例在运行**：若此前手动启动过 Soloist，请先退出手动进程再由插件统一管理。保留默认数据路径即可无缝复用已有配对。

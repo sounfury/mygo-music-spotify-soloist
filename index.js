@@ -647,15 +647,18 @@ const EXE = typeof host !== "undefined" && host.platform === "darwin" ? "bin/sol
 const SOLOIST_TARGETS = {
   windows: {
     exe: "bin/soloist.exe",
+    deviceName: "MyGo Soloist (Windows)",
     downloadUrl: "https://soloist-builds.spotifycdn.com/soloist_release_windows_x86_64.zip",
     versionPlatform: /windows\/x86_64/i,
   },
   darwin: {
     exe: "bin/soloist",
+    deviceName: "MyGo Soloist (macOS)",
     downloadUrl: "https://soloist-builds.spotifycdn.com/soloist_release_osx_arm64.tar.gz",
     versionPlatform: /(?:macos|darwin|osx)\/(?:arm64|aarch64)/i,
   },
 };
+const DEVICE_NAME = typeof host !== "undefined" && host.platform === "darwin" ? "MyGo Soloist (macOS)" : "MyGo Soloist (Windows)";
 const SOLOIST_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const SOLOIST_EXPIRY_DAYS = 90;
 const SOLOIST_EXPIRY_WARN_DAYS = 14;
@@ -1088,7 +1091,11 @@ async function ctl(args, timeout = 5000) {
     throw new Error(`${reason} (${args[0]})`);
   }
   if (r.code) {
-    if (r.code === 3 && !authState?.logged_in) throw new Error(t("Not paired: select MyGo Soloist in Spotify."));
+    if (r.code === 3 && !authState?.logged_in) {
+      throw new Error(t(typeof host !== "undefined" && host.platform === "darwin"
+        ? "Not paired: select MyGo Soloist (macOS) in Spotify."
+        : "Not paired: select MyGo Soloist (Windows) in Spotify."));
+    }
     // Classify locally. The raw CLI output can contain connection details.
     const detail = String(r.error || r.output || "");
     const inactive = /not active|inactive device/i.test(detail);
@@ -1130,7 +1137,7 @@ async function ensureSoloist() {
         if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
       }
       const daemonArgs = [
-        "--device-name", "MyGo Soloist",
+        "--device-name", DEVICE_NAME,
         "--api-key", c.key,
         ...(c.dataDir ? ["--data-dir", c.dataDir] : []),
         ...(c.cacheDir ? ["--cache-dir", c.cacheDir] : []),
@@ -1214,14 +1221,22 @@ async function ready() {
   while (authState && !authState.logged_in && Date.now() - signedOutAt < 1500) await delay(100);
   if (epoch !== startGeneration) throw configurationChanged();
   if (!authState) throw backendError || new Error(t("Soloist did not provide its local connection state."));
-  if (!authState.logged_in) throw new Error(t("Not paired: select MyGo Soloist in Spotify."));
+  if (!authState.logged_in) {
+    throw new Error(t(typeof host !== "undefined" && host.platform === "darwin"
+      ? "Not paired: select MyGo Soloist (macOS) in Spotify."
+      : "Not paired: select MyGo Soloist (Windows) in Spotify."));
+  }
 }
 export async function browse({ page }) {
   if (page !== "soloist") return { title: "Spotify Soloist", sections: [] };
   let description;
   try {
     const a = await within(ensureSoloist(), 5000);
-    description = a.logged_in ? t("Paired and ready. Soloist runs without a terminal window when started by this plugin.") : t("Waiting for pairing: select MyGo Soloist in the Spotify app on your phone.");
+    description = a.logged_in
+      ? t("Paired and ready. Soloist runs without a terminal window when started by this plugin.")
+      : t(typeof host !== "undefined" && host.platform === "darwin"
+        ? "Waiting for pairing: select MyGo Soloist (macOS) in the Spotify app on your phone."
+        : "Waiting for pairing: select MyGo Soloist (Windows) in the Spotify app on your phone.");
   } catch (e) {
     description = soloistUpdateState ? t("Downloading the latest official Spotify Soloist build...") : e.message;
   }
@@ -1255,7 +1270,11 @@ function enqueue(run, report = true, generation = playGeneration) {
   let expired = false, session = null;
   function current() {
     if (epoch !== startGeneration) throw configurationChanged();
-    if (session !== null && session !== sessionRevision) throw backendError || new Error(t("Not paired: select MyGo Soloist in Spotify."));
+    if (session !== null && session !== sessionRevision) {
+      throw backendError || new Error(t(typeof host !== "undefined" && host.platform === "darwin"
+        ? "Not paired: select MyGo Soloist (macOS) in Spotify."
+        : "Not paired: select MyGo Soloist (Windows) in Spotify."));
+    }
     return !expired && (generation === null || generation === playGeneration);
   }
   const job = queueJob.then(async () => {
@@ -1431,12 +1450,12 @@ async function readRemoteState() {
   }
   if (transitionPending || (managed.id && (!playback || !managed.seen))) throw new Error(t("Waiting for the selected track."));
   if (!playback?.is_active) return null;
-  return { playing: playback.status === "playing" || playback.status === "buffering", trackId: trackIdOf(playback.item), position: positionNow(), duration: playback.item?.decorations?.playback?.duration_ms || 0, volume: playback.volume || 0, device: authState?.device_name || "MyGo Soloist" };
+  return { playing: playback.status === "playing" || playback.status === "buffering", trackId: trackIdOf(playback.item), position: positionNow(), duration: playback.item?.decorations?.playback?.duration_ms || 0, volume: playback.volume || 0, device: authState?.device_name || DEVICE_NAME };
 }
 export async function remoteDevices() {
   return reportObservation(async () => {
     const a = await ensureSoloist();
-    return [{ id: "soloist", name: a.device_name || "MyGo Soloist", active: !!a.is_active }];
+    return [{ id: "soloist", name: a.device_name || DEVICE_NAME, active: !!a.is_active }];
   });
 }
 export async function remoteUse({ deviceId }) {
