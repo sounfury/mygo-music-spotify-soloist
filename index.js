@@ -238,7 +238,7 @@ async function api(method, path, body, query, deadline = Date.now() + 12000) {
     if (r.status === 401) { if (generation === authGeneration) host.storage.remove("session"); throw problem("signIn", "Sign in to Spotify again."); }
     if (r.status === 403 && data?.error?.reason === "PREMIUM_REQUIRED") throw new Error(t("A Spotify Premium account is required for playback control."));
     if (r.status === 429) throw new Error(t("Spotify is limiting requests. Try again later."));
-    const e = new Error(data?.error?.message || `Spotify HTTP ${r.status}`); e.status = r.status; throw e;
+    const e = new Error(data?.error?.message || `Spotify HTTP ${r.status}`); e.status = r.status; e.reason = data?.error?.reason || ""; throw e;
   }
   return data;
 }
@@ -262,6 +262,8 @@ export function signOut() {
   refreshing = null;
   host.storage.remove("session");
   host.storage.remove("me");
+  if (typeof suggestCache !== "undefined") suggestCache.clear();
+  if (typeof resetConnectTarget === "function") resetConnectTarget();
 }
 export function setSetting({ key, value }) {
   if (key === "clientId") signOut();
@@ -310,6 +312,77 @@ export async function search({ query, kind, offset = 0 }) {
   if (!map[kind]) return { more: false };
   const result = await api("GET", "/search", undefined, { q: query, type: kind.slice(0, -1), limit: 10, offset });
   const page = result[kind]; return { [kind]: (page?.items || []).map(v => map[kind](v)).filter(Boolean), more: !!page?.next };
+}
+const SUGGEST_CACHE_TTL = 60000;
+const SUGGEST_CACHE_MAX = 50;
+const SUGGEST_TIMEOUT = 3500;
+const SUGGEST_MAX = 8;
+const suggestCache = new Map();
+function rankByQuery(items, qNorm, getName) {
+  const score = item => {
+    const name = String(getName(item) || "").trim().toLowerCase();
+    if (!name) return 3;
+    if (name.startsWith(qNorm)) return 0;
+    if (name.includes(qNorm)) return 1;
+    return 2;
+  };
+  return (items || []).map((item, idx) => ({ item, idx, s: score(item) }))
+    .sort((a, b) => a.s - b.s || a.idx - b.idx)
+    .map(x => x.item);
+}
+function buildSuggestions(query, payload) {
+  const qNorm = String(query || "").trim().toLowerCase();
+  const seen = new Set([qNorm]);
+  const out = [];
+  const add = text => {
+    if (out.length >= SUGGEST_MAX) return false;
+    const label = String(text || "").trim();
+    const key = label.toLowerCase();
+    if (!label || seen.has(key)) return false;
+    seen.add(key);
+    out.push(label);
+    return true;
+  };
+  let artistCount = 0;
+  for (const a of rankByQuery(payload?.artists?.items, qNorm, x => x?.name)) {
+    if (artistCount >= 3 || out.length >= SUGGEST_MAX) break;
+    if (add(a?.name)) artistCount++;
+  }
+  let trackCount = 0;
+  for (const tr of rankByQuery(payload?.tracks?.items, qNorm, x => x?.name)) {
+    if (trackCount >= 5 || out.length >= SUGGEST_MAX) break;
+    const title = String(tr?.name || "").trim();
+    const artist = String(tr?.artists?.[0]?.name || "").trim();
+    if (!title) continue;
+    const label = artist && !title.toLowerCase().includes(artist.toLowerCase()) ? `${title} - ${artist}` : title;
+    if (add(label)) trackCount++;
+  }
+  for (const al of rankByQuery(payload?.albums?.items, qNorm, x => x?.name)) {
+    if (out.length >= SUGGEST_MAX) break;
+    const title = String(al?.name || "").trim();
+    const artist = String(al?.artists?.[0]?.name || "").trim();
+    if (!title) continue;
+    if (!add(title) && artist && !title.toLowerCase().includes(artist.toLowerCase())) {
+      add(`${title} - ${artist}`);
+    }
+  }
+  return out;
+}
+export async function suggest({ query } = {}) {
+  const q = String(query || "").trim();
+  if (!q || /^[A-Za-z0-9]$/.test(q) || !host.storage.get("session")) return [];
+  const key = q.toLowerCase();
+  const cached = suggestCache.get(key);
+  if (cached && Date.now() - cached.at < SUGGEST_CACHE_TTL) return cached.items.slice();
+  try {
+    const result = await api("GET", "/search", undefined, { q, type: "artist,track,album", limit: 5 }, Date.now() + SUGGEST_TIMEOUT);
+    const items = buildSuggestions(q, result);
+    if (suggestCache.size >= SUGGEST_CACHE_MAX) suggestCache.delete(suggestCache.keys().next().value);
+    suggestCache.set(key, { at: Date.now(), items });
+    return items.slice();
+  } catch {
+    return [];
+  }
 }
 export async function recent() {
   if (!host.storage.get("session")) return [];
@@ -1227,19 +1300,160 @@ async function ready() {
       : "Not paired: select MyGo Soloist (Windows) in Spotify."));
   }
 }
-export async function browse({ page }) {
-  if (page !== "soloist") return { title: "Spotify Soloist", sections: [] };
-  let description;
-  try {
-    const a = await within(ensureSoloist(), 5000);
-    description = a.logged_in
-      ? t("Paired and ready. Soloist runs without a terminal window when started by this plugin.")
-      : t(typeof host !== "undefined" && host.platform === "darwin"
-        ? "Waiting for pairing: select MyGo Soloist (macOS) in the Spotify app on your phone."
-        : "Waiting for pairing: select MyGo Soloist (Windows) in the Spotify app on your phone.");
-  } catch (e) {
-    description = soloistUpdateState ? t("Downloading the latest official Spotify Soloist build...") : e.message;
+const LOCAL_DEVICE_ID = "soloist";
+const EXTERNAL_STATE_TTL = 2500;
+let activeDeviceId = LOCAL_DEVICE_ID;
+let activeDeviceName = "";
+let knownDevices = new Map();
+let externalState = null;
+let externalLastTrackId = "";
+let externalVolumeCache = 50;
+let browseActionNonce = 0;
+
+function hasSpotifyApi() { return typeof api === "function" && !!host.storage?.get?.("session"); }
+function isLocalTarget() { return !activeDeviceId || activeDeviceId === LOCAL_DEVICE_ID; }
+function localDeviceName() { return authState?.device_name || DEVICE_NAME; }
+function invalidateExternalState() { externalState = null; }
+function syncExternalVolume(v) {
+  if (typeof v === "number" && Number.isFinite(v)) externalVolumeCache = Math.max(0, Math.min(100, Math.round(v)));
+}
+function externalPositionNow(st) {
+  if (!st) return 0;
+  const elapsed = st.playing ? Math.max(0, Date.now() - st.at) : 0;
+  const pos = st.position + elapsed;
+  return st.duration > 0 ? Math.min(pos, st.duration) : pos;
+}
+function resetConnectTarget() {
+  activeDeviceId = LOCAL_DEVICE_ID;
+  activeDeviceName = "";
+  knownDevices.clear();
+  invalidateExternalState();
+  externalLastTrackId = "";
+}
+function matchLocalWebDevice(devices) {
+  const list = Array.isArray(devices) ? devices : [];
+  if (authState?.device_id) {
+    const byId = list.find(d => d?.id && d.id === authState.device_id);
+    if (byId) return byId;
   }
+  const targetName = localDeviceName().trim().toLowerCase();
+  const byName = list.filter(d => d?.id && String(d.name || "").trim().toLowerCase() === targetName);
+  if (byName.length <= 1) return byName[0] || null;
+  return byName.find(d => !!d.is_active === !!authState?.is_active) || byName[0];
+}
+function deviceTypeLabel(type) {
+  switch (String(type || "")) {
+    case "Soloist": return t("Local Soloist");
+    case "Smartphone": return t("Smartphone");
+    case "Computer": return t("Computer");
+    case "Speaker": return t("Speaker");
+    case "TV": return t("TV");
+    case "Tablet": return t("Tablet");
+    default: return type || t("Spotify Connect");
+  }
+}
+async function fetchConnectDevices({ timeout = 4000 } = {}) {
+  let localAuth = null, localError = null;
+  const localTask = (async () => {
+    try { localAuth = await within(ensureSoloist(), timeout); }
+    catch (e) { localError = e; }
+  })();
+  let webDevices = null, webAvailable = false;
+  const webTask = (async () => {
+    if (!hasSpotifyApi()) return;
+    try {
+      const data = await api("GET", "/me/player/devices", undefined, undefined, Date.now() + timeout);
+      webDevices = Array.isArray(data?.devices) ? data.devices : [];
+      webAvailable = true;
+    } catch {}
+  })();
+  await Promise.all([localTask, webTask]);
+  const localWeb = webAvailable ? matchLocalWebDevice(webDevices) : null;
+  const externals = (webDevices || [])
+    .filter(d => d?.id && !d.is_restricted && (!localWeb || d.id !== localWeb.id))
+    .map(d => ({
+      id: d.id,
+      name: String(d.name || d.id),
+      type: d.type || "Device",
+      active: !!d.is_active,
+      isLocal: false,
+      volume: d.volume_percent,
+      supportsVolume: d.supports_volume !== false,
+    }));
+  const externalActive = externals.some(d => d.active);
+  const devices = [];
+  if (localAuth || soloistTarget()) {
+    const localActive = webAvailable && externalActive ? false : !!(localAuth?.is_active || localWeb?.is_active);
+    devices.push({
+      id: LOCAL_DEVICE_ID,
+      name: localAuth?.device_name || DEVICE_NAME,
+      type: "Soloist",
+      active: localActive,
+      paired: !!localAuth?.logged_in,
+      isLocal: true,
+      webId: localWeb?.id || "",
+    });
+  }
+  devices.push(...externals);
+  if (!localAuth && externals.length === 0 && localError) throw localError;
+  knownDevices = new Map(devices.map(d => [d.id, d]));
+  if (!isLocalTarget()) {
+    const currentExt = knownDevices.get(activeDeviceId);
+    if (currentExt?.name) activeDeviceName = currentExt.name;
+  }
+  return { localAuth, localError, localWebId: localWeb?.id || "", devices, webAvailable };
+}
+export async function browse({ page }) {
+  const isStatusPage = page === "soloist" || String(page || "").startsWith("soloist:refresh:") || String(page || "").startsWith("soloist:use:");
+  if (!isStatusPage) return { title: "Spotify Soloist", sections: [] };
+  let switchNotice = "";
+  if (String(page).startsWith("soloist:use:") && typeof remoteUse === "function") {
+    const raw = String(page).slice("soloist:use:".length);
+    const sep = raw.lastIndexOf(":");
+    const encodedId = sep > 0 ? raw.slice(0, sep) : raw;
+    let targetId = encodedId;
+    try { targetId = decodeURIComponent(encodedId); } catch {}
+    try {
+      await remoteUse({ deviceId: targetId });
+      const chosenName = targetId === LOCAL_DEVICE_ID
+        ? localDeviceName()
+        : (activeDeviceName || knownDevices.get(targetId)?.name || targetId);
+      switchNotice = `${t("Switched playback device to:")} ${chosenName}`;
+    } catch (e) {
+      switchNotice = e?.message || t("Failed to switch Spotify playback device.");
+    }
+  }
+  let description = "";
+  let connectInfo = null;
+  if (hasSpotifyApi()) {
+    try { connectInfo = await fetchConnectDevices({ timeout: 5000 }); }
+    catch (e) { connectInfo = { localAuth: null, localError: e, devices: [], webAvailable: false }; }
+  }
+  if (!isLocalTarget()) {
+    description = `${t("Playing via Spotify Connect:")} ${activeDeviceName || activeDeviceId}`;
+  } else if (connectInfo) {
+    if (connectInfo.localAuth) {
+      description = connectInfo.localAuth.logged_in
+        ? t("Paired and ready. Soloist runs without a terminal window when started by this plugin.")
+        : t(typeof host !== "undefined" && host.platform === "darwin"
+          ? "Waiting for pairing: select MyGo Soloist (macOS) in the Spotify app on your phone."
+          : "Waiting for pairing: select MyGo Soloist (Windows) in the Spotify app on your phone.");
+    } else if (connectInfo.localError) {
+      description = soloistUpdateState ? t("Downloading the latest official Spotify Soloist build...") : connectInfo.localError.message;
+    }
+  } else {
+    try {
+      const a = await within(ensureSoloist(), 5000);
+      description = a.logged_in
+        ? t("Paired and ready. Soloist runs without a terminal window when started by this plugin.")
+        : t(typeof host !== "undefined" && host.platform === "darwin"
+          ? "Waiting for pairing: select MyGo Soloist (macOS) in the Spotify app on your phone."
+          : "Waiting for pairing: select MyGo Soloist (Windows) in the Spotify app on your phone.");
+    } catch (e) {
+      description = soloistUpdateState ? t("Downloading the latest official Spotify Soloist build...") : e.message;
+    }
+  }
+  if (switchNotice) description = description ? `${switchNotice}\n${description}` : switchNotice;
   const sections = [{ title: t("Official Spotify audio"), empty: t("Soloist handles playback. Use MyGo Music to select songs and control playback. Keep this local API bound to 127.0.0.1.") }];
   let build = getSoloistBuild();
   if (!build.version && !soloistUpdateState) {
@@ -1259,13 +1473,33 @@ export async function browse({ page }) {
     }
     sections.unshift({ title: t("Soloist Engine"), empty: parts.join(" · ") });
   }
+  if (connectInfo && (connectInfo.devices.length > 0 || connectInfo.webAvailable)) {
+    const links = connectInfo.devices.map(d => {
+      const selected = d.isLocal ? isLocalTarget() : activeDeviceId === d.id;
+      const typeText = deviceTypeLabel(d.type);
+      const statusText = selected
+        ? (d.active ? t("Active") : t("Selected"))
+        : (d.active ? t("Active on Spotify · Click to control") : t("Click to switch"));
+      return {
+        title: selected ? `● ${d.name}` : d.name,
+        subtitle: `${statusText} · ${typeText}`,
+        page: `soloist:use:${encodeURIComponent(d.id)}:${++browseActionNonce}`,
+      };
+    });
+    links.push({
+      title: t("Refresh devices"),
+      subtitle: t("Scan online Spotify Connect devices"),
+      page: `soloist:refresh:${++browseActionNonce}`,
+    });
+    sections.unshift({ title: t("Playback Devices"), links });
+  }
   if (lastPlaybackError) sections.unshift({ title: t("Last Playback Error"), empty: lastPlaybackError });
   return { title: t("Playback Status"), description, sections };
 }
 // MyGo gives plugin calls 30 seconds, including time spent behind another command.
 let queueJob = Promise.resolve();
 let playGeneration = 0;
-function enqueue(run, report = true, generation = playGeneration) {
+function enqueue(run, report = true, generation = playGeneration, needLocal = null) {
   const epoch = startGeneration, deadline = Date.now() + 26000;
   let expired = false, session = null;
   function current() {
@@ -1279,8 +1513,11 @@ function enqueue(run, report = true, generation = playGeneration) {
   }
   const job = queueJob.then(async () => {
     if (!current()) return;
-    await within(ready(), deadline - Date.now());
-    session = sessionRevision;
+    const useLocal = needLocal === null ? isLocalTarget() : !!needLocal;
+    if (useLocal) {
+      await within(ready(), deadline - Date.now());
+      session = sessionRevision;
+    }
     if (!current()) return;
     await run(current, deadline);
     current();
@@ -1396,24 +1633,141 @@ async function playTarget(id, position, current, deadline, resume = false) {
   }
   if (current()) playbackError(warning);
 }
+function externalApiError(e) {
+  if (e?.status === 404 || e?.reason === "NO_ACTIVE_DEVICE") {
+    return new Error(t("Selected Spotify device is unavailable. Refresh devices in Playback Status or switch back to local Soloist."));
+  }
+  return e;
+}
+async function externalPlay(id, position, deadline) {
+  const pos = Math.max(0, Math.round(position));
+  try {
+    await api("PUT", "/me/player/play", { uris: [`spotify:track:${id}`], ...(pos > 0 ? { position_ms: pos } : {}) }, { device_id: activeDeviceId }, deadline);
+  } catch (e) { throw externalApiError(e); }
+  externalLastTrackId = id;
+  externalState = { playing: true, trackId: id, position: pos, duration: 0, volume: externalVolumeCache, device: activeDeviceName || activeDeviceId, at: Date.now(), fetchedAt: 0 };
+  playbackError("");
+}
+async function externalPause(deadline) {
+  try {
+    await api("PUT", "/me/player/pause", undefined, { device_id: activeDeviceId }, deadline);
+  } catch (e) {
+    if (!(e?.status === 403 && /Restriction violated|ALREADY_PAUSED/i.test(`${e.reason || ""} ${e.message || ""}`))) throw externalApiError(e);
+  }
+  invalidateExternalState();
+}
+async function externalResume(deadline) {
+  try {
+    await api("PUT", "/me/player/play", undefined, { device_id: activeDeviceId }, deadline);
+    invalidateExternalState();
+    playbackError("");
+  } catch (e) {
+    if ((e?.status === 404 || e?.reason === "NO_ACTIVE_DEVICE") && externalLastTrackId) {
+      return externalPlay(externalLastTrackId, 0, deadline);
+    }
+    throw externalApiError(e);
+  }
+}
+async function externalSeek(position, deadline) {
+  const pos = Math.max(0, Math.round(position));
+  try {
+    await api("PUT", "/me/player/seek", undefined, { position_ms: pos, device_id: activeDeviceId }, deadline);
+  } catch (e) { throw externalApiError(e); }
+  invalidateExternalState();
+}
+async function externalVolume(percent, deadline) {
+  const vol = Math.max(0, Math.min(100, Math.round(percent)));
+  try {
+    await api("PUT", "/me/player/volume", undefined, { volume_percent: vol, device_id: activeDeviceId }, deadline);
+    externalVolumeCache = vol;
+    invalidateExternalState();
+  } catch (e) {
+    if (e?.status === 403 && /VOLUME_CONTROL_DISALLOWED/i.test(`${e.reason || ""} ${e.message || ""}`)) {
+      playbackError(t("This Spotify device does not allow remote volume control."));
+      return;
+    }
+    throw externalApiError(e);
+  }
+}
+async function readExternalState() {
+  if (!hasSpotifyApi()) {
+    resetConnectTarget();
+    return readRemoteState();
+  }
+  if (externalState && externalState.fetchedAt && Date.now() - externalState.fetchedAt < EXTERNAL_STATE_TTL) {
+    return {
+      playing: externalState.playing,
+      trackId: externalState.trackId,
+      position: externalPositionNow(externalState),
+      duration: externalState.duration,
+      volume: externalState.volume,
+      device: externalState.device,
+    };
+  }
+  const st = await api("GET", "/me/player", undefined, undefined, Date.now() + 6000);
+  if (!st || !st.item) {
+    invalidateExternalState();
+    return null;
+  }
+  if (st.is_playing && st.device?.id && st.device.id !== activeDeviceId) {
+    const localWebId = knownDevices.get(LOCAL_DEVICE_ID)?.webId;
+    if ((localWebId && st.device.id === localWebId) || (authState?.is_active && String(st.device.name || "").trim().toLowerCase() === localDeviceName().trim().toLowerCase())) {
+      activeDeviceId = LOCAL_DEVICE_ID;
+      activeDeviceName = "";
+      invalidateExternalState();
+      return readRemoteState();
+    }
+    activeDeviceId = st.device.id;
+    activeDeviceName = st.device.name || st.device.id;
+  } else if (st.device?.id === activeDeviceId && st.device?.name) {
+    activeDeviceName = st.device.name;
+  }
+  syncExternalVolume(st.device?.volume_percent);
+  const trackId = st.item.id || "";
+  if (trackId) externalLastTrackId = trackId;
+  const now = Date.now();
+  externalState = {
+    playing: !!st.is_playing,
+    trackId,
+    position: st.progress_ms || 0,
+    duration: st.item.duration_ms || 0,
+    volume: externalVolumeCache,
+    device: st.device?.name || activeDeviceName || activeDeviceId,
+    at: now,
+    fetchedAt: now,
+  };
+  return {
+    playing: externalState.playing,
+    trackId: externalState.trackId,
+    position: externalState.position,
+    duration: externalState.duration,
+    volume: externalState.volume,
+    device: externalState.device,
+  };
+}
 export async function remotePlay({ ids, start = 0, position = 0 }) {
   ++playGeneration;
   failedPlay = null;
   return enqueue((current, deadline) => {
     const id = ids?.[start];
     if (!id) throw new Error(t("No track selected."));
+    if (!isLocalTarget()) return externalPlay(id, position, deadline);
     return playTarget(id, position, current, deadline);
   });
 }
 export async function remotePause() {
   ++playGeneration;
-  if (managed.id && (!managed.seen || playback?.status === "buffering")) failedPlay = { id: managed.id, revision: playbackRevision, until: Date.now() + 30000 };
-  return enqueue((current, deadline) => ctl(["pause"], budget(deadline, 5000)));
+  if (isLocalTarget() && managed.id && (!managed.seen || playback?.status === "buffering")) failedPlay = { id: managed.id, revision: playbackRevision, until: Date.now() + 30000 };
+  return enqueue((current, deadline) => {
+    if (!isLocalTarget()) return externalPause(deadline);
+    return ctl(["pause"], budget(deadline, 5000));
+  });
 }
 export async function remoteResume() {
   ++playGeneration;
   failedPlay = null;
   return enqueue(async (current, deadline) => {
+    if (!isLocalTarget()) return externalResume(deadline);
     if (!detachedTrackId && !managed.id && !playback?.item) await readSnapshot(current, deadline);
     if (!current()) return;
     const id = detachedTrackId || managed.id || trackIdOf(playback?.item);
@@ -1424,10 +1778,16 @@ export async function remoteResume() {
   });
 }
 export async function remoteSeek({ position }) {
-  return enqueue((current, deadline) => ctl(["seek", String(Math.max(0, Math.round(position)))], budget(deadline, 5000)));
+  return enqueue((current, deadline) => {
+    if (!isLocalTarget()) return externalSeek(position, deadline);
+    return ctl(["seek", String(Math.max(0, Math.round(position)))], budget(deadline, 5000));
+  });
 }
 export async function remoteVolume({ percent }) {
-  return enqueue((current, deadline) => ctl(["volume", String(Math.max(0, Math.min(100, Math.round(percent))))], budget(deadline, 5000)), true, null);
+  return enqueue((current, deadline) => {
+    if (!isLocalTarget()) return externalVolume(percent, deadline);
+    return ctl(["volume", String(Math.max(0, Math.min(100, Math.round(percent))))], budget(deadline, 5000));
+  }, true, null);
 }
 async function reportObservation(read) {
   const epoch = startGeneration, generation = playGeneration;
@@ -1438,6 +1798,7 @@ async function reportObservation(read) {
 }
 export async function remoteState() { return reportObservation(readRemoteState); }
 async function readRemoteState() {
+  if (!isLocalTarget()) return readExternalState();
   await ready();
   if (transitionPending || (managed.id && (!playback || !managed.seen))) {
     const epoch = startGeneration, generation = playGeneration;
@@ -1454,15 +1815,81 @@ async function readRemoteState() {
 }
 export async function remoteDevices() {
   return reportObservation(async () => {
-    const a = await ensureSoloist();
-    return [{ id: "soloist", name: a.device_name || DEVICE_NAME, active: !!a.is_active }];
+    const { devices } = await fetchConnectDevices();
+    return devices.map(d => ({ id: d.id, name: d.name, active: !!d.active }));
   });
 }
+async function switchToLocal(current, deadline, localReady = false) {
+  const wasExternal = !isLocalTarget();
+  let shouldPlay = false;
+  if (wasExternal && hasSpotifyApi()) {
+    try {
+      const st = await api("GET", "/me/player", undefined, undefined, Math.min(deadline, Date.now() + 3000));
+      shouldPlay = !!st?.is_playing;
+    } catch { shouldPlay = !!externalState?.playing; }
+  }
+  if (!localReady) await within(ready(), deadline - Date.now());
+  if (!current()) return;
+  activeDeviceId = LOCAL_DEVICE_ID;
+  activeDeviceName = "";
+  detachedTrackId = "";
+  invalidateExternalState();
+  if (wasExternal && hasSpotifyApi()) {
+    let localWebId = knownDevices.get(LOCAL_DEVICE_ID)?.webId || "";
+    if (!localWebId) {
+      try { localWebId = (await fetchConnectDevices({ timeout: Math.min(3000, Math.max(500, deadline - Date.now())) })).localWebId; } catch {}
+    }
+    if (localWebId) {
+      try { await api("PUT", "/me/player", { device_ids: [localWebId], play: shouldPlay }, undefined, Math.min(deadline, Date.now() + 4000)); } catch {}
+    }
+  }
+  await activate(current, deadline, wasExternal);
+  if (wasExternal && current()) {
+    try { await readSnapshot(current, deadline); } catch {}
+    playbackError("");
+  }
+}
 export async function remoteUse({ deviceId }) {
-  return enqueue((current, deadline) => {
-    if (deviceId !== "soloist") throw new Error(t("Unknown Soloist device."));
-    return activate(current, deadline);
-  }, true, null);
+  const id = String(deviceId || "").trim();
+  const knownLocalWebId = knownDevices.get(LOCAL_DEVICE_ID)?.webId || "";
+  const targetLocal = id === LOCAL_DEVICE_ID || (!!knownLocalWebId && id === knownLocalWebId);
+  return enqueue(async (current, deadline) => {
+    if (targetLocal) return switchToLocal(current, deadline, true);
+    if (!id || !hasSpotifyApi()) throw new Error(t("Unknown Soloist device."));
+    let dev = knownDevices.get(id);
+    if (!dev || dev.isLocal) {
+      const info = await fetchConnectDevices({ timeout: Math.min(4000, Math.max(1000, deadline - Date.now())) });
+      if (info.localWebId && info.localWebId === id) {
+        return switchToLocal(current, deadline, false);
+      }
+      dev = knownDevices.get(id);
+    }
+    if (!dev || dev.isLocal) {
+      throw new Error(t("Selected Spotify device is unavailable. Refresh devices in Playback Status or switch back to local Soloist."));
+    }
+    let wasPlaying = false;
+    if (isLocalTarget()) {
+      wasPlaying = playback?.status === "playing" || playback?.status === "buffering";
+    } else if (externalState) {
+      wasPlaying = !!externalState.playing;
+    } else {
+      try {
+        const st = await api("GET", "/me/player", undefined, undefined, Math.min(deadline, Date.now() + 3000));
+        wasPlaying = !!st?.is_playing;
+      } catch {}
+    }
+    try {
+      await api("PUT", "/me/player", { device_ids: [id], play: wasPlaying }, undefined, deadline);
+    } catch (e) { throw externalApiError(e); }
+    activeDeviceId = id;
+    activeDeviceName = dev.name || id;
+    syncExternalVolume(dev.volume);
+    manage();
+    detachedTrackId = "";
+    failedPlay = null;
+    invalidateExternalState();
+    playbackError("");
+  }, true, null, targetLocal);
 }
 
 // Start Soloist in the background as soon as MyGo mounts this plugin runtime.

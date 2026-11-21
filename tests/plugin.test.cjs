@@ -1,27 +1,28 @@
 const test=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs');const vm=require('node:vm');const path=require('node:path');
 const source=fs.readFileSync(path.join(__dirname,'../index.js'),'utf8');
-function controller({ active = true, beforeReady, command, saved, onDelay } = {}) {
+function controller({ active = true, beforeReady, command, saved, onDelay, apiMock, platform = 'windows', arch = 'amd64' } = {}) {
   let now = 1000;
   const commands = [], store = saved || new Map();
   const c = {
     Date: { now: () => now }, setTimeout, clearTimeout, t: s => s,
     delay: async ms => { now += ms; onDelay?.(api, ms); },
-    host: { storage: { get: k => store.get(k), set: (k,v) => store.set(k,v), remove: k => store.delete(k) } },
+    host: { platform, arch, storage: { get: k => store.get(k), set: (k,v) => store.set(k,v), remove: k => store.delete(k) } },
     readyImpl: async () => beforeReady?.(),
     ctlImpl: async args => {
       commands.push(Array.from(args));
       return command?.(args, api) ?? '';
     },
+    ...(apiMock ? { api: apiMock } : {}),
   };
   const sourceFrom = source.indexOf('const EXE =');
   const code = source.slice(source.indexOf('function killProcess('),source.indexOf('async function helper(')) +
     source.slice(sourceFrom, source.indexOf('// Start Soloist in the background')).replaceAll('export async function','async function');
   vm.runInNewContext(code + `
     ready = readyImpl; ctl = ctlImpl; ensureSoloist = async () => authState;
-    globalThis.api = { onEvent, positionNow, remotePlay, remoteResume, remotePause, remoteState, remoteSeek, remoteVolume, remoteUse, remoteDevices, browse, stopSoloist,
+    globalThis.__ctrl = { onEvent, positionNow, remotePlay, remoteResume, remotePause, remoteState, remoteSeek, remoteVolume, remoteUse, remoteDevices, browse, stopSoloist,
       get: () => playback, auth: () => authState, getError: () => lastPlaybackError, setError: playbackError, settled: () => queueJob };
   `, c);
-  const api = { ...c.api, commands, store, tick: ms => now += ms };
+  const api = { ...c.__ctrl, commands, store, tick: ms => now += ms };
   api.onEvent({type:'auth_state', logged_in:true, is_active:active});
   return api;
 }
@@ -1175,4 +1176,183 @@ test('macOS spawnProcess, Keychain helper routing, Intel macOS rejection, and LF
   const shContent=fs.readFileSync(path.join(__dirname,'../scripts/soloist-host.sh'),'utf8');
   assert.equal(shContent.includes('\r'),false,'scripts/soloist-host.sh must use LF line endings only');
   assert.match(shContent,/^#!\/bin\/sh\n/);
+});
+
+test('search suggest merges artist/track/album, ranks prefix matches, caches results, and fails silently',async()=>{
+  const from=source.indexOf('const image = items =>'),to=source.indexOf('export async function liked(',from);
+  assert(from>=0&&to>from);
+  const code=source.slice(from,to).replaceAll('export async function','async function');
+  const calls=[];
+  let now=10000, failNext=false, signedIn=true;
+  const c={
+    Date:{now:()=>now}, Set, Map,
+    t:s=>s,
+    host:{storage:{get:k=>k==='session'?(signedIn?{access:'tok'}:null):null}},
+    api:async(method,p,body,query)=>{
+      calls.push({method,p,query});
+      if(failNext)throw Object.assign(new Error('429'),{status:429});
+      return {
+        artists:{items:[
+          {name:'The Weekend Project'},
+          {name:'周杰伦'},
+          {name:'Jay Chou'},
+        ]},
+        tracks:{items:[
+          {name:'七里香',artists:[{name:'周杰伦'}]},
+          {name:'周杰伦 - 晴天',artists:[{name:'周杰伦'}]},
+          {name:'夜曲',artists:[{name:'周杰伦'}]},
+        ]},
+        albums:{items:[
+          {name:'七里香',artists:[{name:'周杰伦'}]},
+          {name:'叶惠美',artists:[{name:'周杰伦'}]},
+        ]},
+      };
+    },
+  };
+  vm.runInNewContext(code+';globalThis.subject={suggest};',c);
+
+  // Unauthenticated, empty, or single ASCII char must not hit Spotify API.
+  signedIn=false;
+  assert.deepEqual(Array.from(await c.subject.suggest({query:'周杰伦'})),[]);
+  signedIn=true;
+  assert.deepEqual(Array.from(await c.subject.suggest({query:''})),[]);
+  assert.deepEqual(Array.from(await c.subject.suggest({query:'a'})),[]);
+  assert.equal(calls.length,0);
+
+  // Single CJK character is allowed and merges artist/track/album in one limit<=10 request.
+  const first=Array.from(await c.subject.suggest({query:'周'}));
+  assert.equal(calls.length,1);
+  assert.deepEqual({...calls[0],query:{...calls[0].query}},{method:'GET',p:'/search',query:{q:'周',type:'artist,track,album',limit:5}});
+  assert.equal(first[0],'周杰伦');
+  assert.ok(first.includes('七里香 - 周杰伦'));
+  assert.ok(first.includes('周杰伦 - 晴天')); // must not double-append artist
+  assert.ok(first.includes('七里香')); // album title distinct from '七里香 - 周杰伦'
+  assert.ok(first.length<=8);
+
+  // Repeat call within 60s TTL must hit cache without another API call.
+  now+=5000;
+  const cached=Array.from(await c.subject.suggest({query:'周'}));
+  assert.deepEqual(cached,first);
+  assert.equal(calls.length,1);
+
+  // After TTL expiry, errors (e.g. 429) must return [] silently.
+  now+=65000;
+  failNext=true;
+  assert.deepEqual(Array.from(await c.subject.suggest({query:'周'})),[]);
+  assert.equal(calls.length,2);
+});
+
+test('Spotify Connect multi-device discovery, transfer, external playback routing, and browse switcher',async()=>{
+  const apiCalls=[];
+  const store=new Map([['session',{access:'tok'}]]);
+  let webActiveId='soloist-web-1';
+  let webPlaying=true;
+  let webPos=12000;
+  let volumeDisallowed=false;
+  const s=controller({
+    platform:'darwin',
+    arch:'arm64',
+    saved:store,
+    command(args,api){
+      if(args[0]==='activate')api.onEvent({type:'auth_state',logged_in:true,is_active:true,device_name:'MyGo Soloist (macOS)'});
+      if(args[0]==='now')return JSON.stringify(snapshot('t-back',{is_active:true}));
+      if(args[0]==='play')api.onEvent(snapshot(args[1].slice(14)));
+    },
+    apiMock:async(method,p,body,query)=>{
+      apiCalls.push({method,p,body,query});
+      if(method==='GET'&&p==='/me/player/devices'){
+        return {devices:[
+          {id:'soloist-web-1',name:'MyGo Soloist (macOS)',type:'Speaker',is_active:webActiveId==='soloist-web-1',is_restricted:false,volume_percent:60},
+          {id:'phone-1',name:'iPhone',type:'Smartphone',is_active:webActiveId==='phone-1',is_restricted:false,volume_percent:75},
+          {id:'restricted-1',name:'Locked Speaker',type:'Speaker',is_active:false,is_restricted:true,volume_percent:50},
+        ]};
+      }
+      if(method==='PUT'&&p==='/me/player'){
+        webActiveId=body.device_ids[0];
+        if(typeof body.play==='boolean')webPlaying=body.play;
+        return null;
+      }
+      if(method==='PUT'&&p==='/me/player/play'){
+        webActiveId=query.device_id;
+        webPlaying=true;
+        if(body?.position_ms!=null)webPos=body.position_ms;
+        return null;
+      }
+      if(method==='PUT'&&p==='/me/player/pause'){
+        webPlaying=false;
+        return null;
+      }
+      if(method==='PUT'&&p==='/me/player/seek'){
+        webPos=query.position_ms;
+        return null;
+      }
+      if(method==='PUT'&&p==='/me/player/volume'){
+        if(volumeDisallowed)throw Object.assign(new Error('Volume not allowed'),{status:403,reason:'VOLUME_CONTROL_DISALLOWED'});
+        return null;
+      }
+      if(method==='GET'&&p==='/me/player'){
+        return {
+          is_playing:webPlaying,
+          progress_ms:webPos,
+          item:{id:'ext-track-1',duration_ms:200000},
+          device:{id:webActiveId,name:webActiveId==='phone-1'?'iPhone':'MyGo Soloist (macOS)',volume_percent:75},
+        };
+      }
+      throw new Error(`unexpected ${method} ${p}`);
+    },
+  });
+  s.onEvent({type:'auth_state',logged_in:true,is_active:true,device_name:'MyGo Soloist (macOS)'});
+  s.onEvent(snapshot('local-1'));
+
+  // 1. remoteDevices deduplicates local Soloist, drops restricted devices, and includes external Connect devices.
+  const devices=Array.from(await s.remoteDevices(),d=>({...d}));
+  assert.deepEqual(devices,[
+    {id:'soloist',name:'MyGo Soloist (macOS)',active:true},
+    {id:'phone-1',name:'iPhone',active:false},
+  ]);
+
+  // 2. browse({page:'soloist'}) renders clickable Playback Devices cards + Refresh button.
+  const statusPage=await s.browse({page:'soloist'});
+  const devSec=statusPage.sections.find(sec=>sec.title==='Playback Devices');
+  assert.ok(devSec&&devSec.links.length===3);
+  const phoneLink=devSec.links.find(l=>l.title.includes('iPhone'));
+  assert.ok(phoneLink&&phoneLink.page.startsWith('soloist:use:phone-1:'));
+
+  // 3. Clicking the iPhone link transfers playback via PUT /me/player with play:true and updates status description.
+  const switchedPage=await s.browse({page:phoneLink.page});
+  assert.match(switchedPage.description,/Switched playback device to: iPhone/);
+  assert.match(switchedPage.description,/Playing via Spotify Connect: iPhone/);
+  const transferCall=apiCalls.find(c=>c.method==='PUT'&&c.p==='/me/player');
+  assert.deepEqual({device_ids:Array.from(transferCall.body.device_ids),play:transferCall.body.play},{device_ids:['phone-1'],play:true});
+
+  // 4. Subsequent playback commands route through Web API targeting phone-1, never invoking local soloist ctl.
+  const ctlCountBefore=s.commands.length;
+  await s.remotePlay({ids:['ext-track-1'],start:0,position:5000});
+  await s.remoteSeek({position:30000});
+  volumeDisallowed=true;
+  await s.remoteVolume({percent:80}); // must degrade gracefully on VOLUME_CONTROL_DISALLOWED
+  assert.match(s.getError(),/does not allow remote volume control/);
+  assert.equal(s.commands.length,ctlCountBefore);
+
+  // 5. remoteState polls GET /me/player, interpolates within 2.5s TTL without re-fetching, and invalidates after pause.
+  const playerGetsBefore=apiCalls.filter(c=>c.method==='GET'&&c.p==='/me/player').length;
+  const st1=await s.remoteState();
+  assert.equal(st1.trackId,'ext-track-1');
+  assert.equal(st1.position,30000);
+  assert.equal(st1.device,'iPhone');
+  s.tick(1000);
+  const st2=await s.remoteState();
+  assert.equal(st2.position,31000);
+  assert.equal(apiCalls.filter(c=>c.method==='GET'&&c.p==='/me/player').length,playerGetsBefore+1);
+
+  await s.remotePause();
+  const st3=await s.remoteState();
+  assert.equal(st3.playing,false);
+
+  // 6. Switching back to local Soloist (including via its Web API id) transfers back without deadlocking and resumes local ctl.
+  await s.remoteUse({deviceId:'soloist-web-1'});
+  assert.equal(webActiveId,'soloist-web-1');
+  assert.ok(s.commands.some(c=>c[0]==='activate'));
+  await s.remotePlay({ids:['local-2']});
+  assert.ok(s.commands.some(c=>c[0]==='play'&&c[1]==='spotify:track:local-2'));
 });
