@@ -96,7 +96,7 @@
    - **API Key 双源解析与热切换**：`resolveConfig()` 优先读取插件设置中的 `soloistApiKey`（零 PowerShell 开销，且不覆写 `-D`/`-C`，直接沿用 Soloist 官方默认目录 `%LOCALAPPDATA%\soloist\{data,cache}`），留空时自动回退到 `soloist-host.ps1 -Action config`（同样指向 `%LOCALAPPDATA%\soloist\{data,cache}`），两种方式完全共享配对凭证与缓存。修改 `soloistApiKey` 时 `setSetting()` 调用 `stopSoloist()` 递增 `startGeneration`、安全回收旧 `watcher`/`daemon` 并立即以新 Key 后台预热。
    - **挂载预热与单飞启动锁**：模块顶层通过 `setTimeout(warmupSoloist, 0)` 在事件循环首个宏任务静默触发 `ensureSoloist()`（登录后也会补触发一次），不执行 `activate`，避免抢占其他设备焦点；`startPromise` 配合 `startGeneration` 确保并发播放复用同一次启动且旧配置启动不会污染新实例，轮询超时时主动清理未响应子进程。
    - **事件驱动状态机**：通过 `soloist.exe ctl trace` 持续消费 JSON 事件流（按 `watcher === p` 隔离旧追踪器），`positionNow()` 基于本地时钟锚点 `anchoredAt` 插值计算进度，避免依赖守护进程挂钟或高频轮询云端。
-   - **队列串行化与代际抢占**：`remotePlay()` 通过 `queueJob` 串行执行、通过 `playGeneration` 递增实现“后点覆盖前点”，`remotePause()`、`signOut()` 与 `stopSoloist()` 也会递增代际以取消尚未落地的播控请求。
+   - **本地直连起播与代际抢占**：`remotePlay()` 直接通过本地 `soloist.exe ctl play spotify:track:<id>`（未激活时先 `ctl activate`）起播，彻底绕开 Spotify 云端 `/me/player/devices` 轮询与 `PUT /me/player/play` 延迟，并按需跳过已关闭的 `shuffle`/`repeat`；由 MyGo 播放器自身接管队列顺序与切歌。通过 `queueJob` 串行化与 `playGeneration` 代际递增实现“后点覆盖前点”与暂停取消，同时将完整播控错误记录到 `lastPlaybackError` 并在「播放状态」页展示。
 
 ---
 

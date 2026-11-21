@@ -612,7 +612,7 @@ export async function lyrics({ id }) {
 // The desktop app owns these child processes; MyGo hides their Windows consoles.
 const EXE = "bin/soloist.exe";
 let configPromise = null, startPromise = null, startGeneration = 0, daemon = null, watcher = null;
-let authState = null, playback = null, anchoredAt = 0, backendError = null;
+let authState = null, playback = null, anchoredAt = 0, backendError = null, lastPlaybackError = "";
 async function resolveConfig() {
   const directKey = (host.setting?.("soloistApiKey") || "").trim();
   if (directKey) return { key: directKey, source: "setting" };
@@ -625,7 +625,7 @@ function stopSoloist() {
   ++startGeneration;
   if (typeof playGeneration === "number") ++playGeneration;
   const oldWatcher = watcher, oldDaemon = daemon;
-  startPromise = null; watcher = null; daemon = null; authState = null; playback = null; anchoredAt = 0; backendError = null; configPromise = null;
+  startPromise = null; watcher = null; daemon = null; authState = null; playback = null; anchoredAt = 0; backendError = null; lastPlaybackError = ""; configPromise = null;
   try { oldWatcher?.kill?.(); } catch {}
   try { oldDaemon?.kill?.(); } catch {}
 }
@@ -662,7 +662,13 @@ async function watch(c) {
 }
 async function ctl(args, timeout) {
   const c = await config(); const r = await processResult(EXE, ["ctl", ...args, ...dataArgs(c)], timeout);
-  if (r.code) throw new Error(r.code === 3 ? t("Pair MyGo Soloist from the Spotify app on your phone first.") : t("Soloist could not complete the command. Check the Playback Status page."));
+  if (r.code) {
+    const detail = String(r.error || r.output || "").trim().split(/\r?\n/)[0];
+    if (r.code === 3 && !authState?.logged_in) throw problem("setup", "Not paired: select MyGo Soloist in Spotify.");
+    const err = new Error(t("Playback failed. Open Playback Status for details."));
+    if (detail) err.detail = detail;
+    throw err;
+  }
   return r.output;
 }
 async function ensureSoloist() {
@@ -731,7 +737,7 @@ function warmupSoloist() {
 }
 async function ready() {
   const state = await ensureSoloist();
-  if (!state.logged_in) throw problem("setup", "Select MyGo Soloist in the Spotify app on your phone to pair this computer, then play again.");
+  if (!state.logged_in) throw problem("setup", "Not paired: select MyGo Soloist in Spotify.");
 }
 export async function browse({ page }) {
   if (page !== "soloist") return { title: "Spotify Soloist", sections: [] };
@@ -740,9 +746,11 @@ export async function browse({ page }) {
     const a = await ensureSoloist();
     description = a.logged_in ? t("Paired and ready. Soloist runs without a terminal window when started by this plugin.") : t("Waiting for pairing: select MyGo Soloist in the Spotify app on your phone.");
   } catch (e) { description = e.message; }
-  return { title: t("Playback Status"), description, sections: [{ title: t("Official Spotify audio"), empty: t("Soloist handles playback. Use MyGo Music to select songs and control playback. Keep this local API bound to 127.0.0.1.") }] };
+  const sections = [{ title: t("Official Spotify audio"), empty: t("Soloist handles playback. Use MyGo Music to select songs and control playback. Keep this local API bound to 127.0.0.1.") }];
+  if (lastPlaybackError) sections.unshift({ title: t("Last Playback Error"), empty: lastPlaybackError });
+  return { title: t("Playback Status"), description, sections };
 }
-// Spotify accepts URI lists for Soloist, preserving MyGo's queue without creating playlists.
+// Play directly via local Soloist WebSocket CLI for low latency; MyGo manages queue progression.
 let queueJob = Promise.resolve();
 let playGeneration = 0;
 export async function remotePlay({ ids, start = 0, position = 0 }) {
@@ -753,25 +761,31 @@ export async function remotePlay({ ids, start = 0, position = 0 }) {
     if (!current()) return;
     await ready();
     if (!current()) return;
-    const selected = ids.slice(start, start + 100); if (!selected.length) return;
-    await ctl(["activate"], 4000);
-    let device;
-    const visibleUntil = Math.min(deadline - 5000, Date.now() + 8000);
-    do {
-      const list = await api("GET", "/me/player/devices", undefined, undefined, Math.min(deadline - 3000, Date.now() + 4000));
-      device = list.devices.find(d => d.name === authState.device_name && d.id && !d.is_restricted);
-      if (device || !current()) break;
-      await delay(500);
-    } while (Date.now() < visibleUntil);
-    if (!device) throw new Error(t("Soloist is paired but not visible to this Spotify account. Check that both sign-ins use the same account."));
-    await ctl(["shuffle", "off"], 4000); await ctl(["repeat", "off"], 4000);
+    const trackId = ids?.[start];
+    if (!trackId) return;
+    if (!authState?.is_active) {
+      await ctl(["activate"], 4000);
+      if (!current()) return;
+    }
+    await ctl(["play", `spotify:track:${trackId}`], 6000);
     if (!current()) return;
-    await api("PUT", "/me/player/play", { uris: selected.map(id => "spotify:track:" + id), offset: { position: 0 }, position_ms: Math.max(0, Math.round(position)) }, { device_id: device.id }, deadline);
+    const pos = Math.max(0, Math.round(position));
+    const extras = [];
+    if (pos > 0) extras.push(ctl(["seek", String(pos)], 4000));
+    if (playback?.options?.shuffle) extras.push(ctl(["shuffle", "off"], 4000).catch(() => {}));
+    if (playback?.options?.repeat && playback.options.repeat !== "off") extras.push(ctl(["repeat", "off"], 4000).catch(() => {}));
+    if (extras.length) await Promise.all(extras);
+    lastPlaybackError = "";
   };
-  const result = queueJob.then(run); queueJob = result.catch(() => {}); return result;
+  const result = queueJob.then(run).catch(e => {
+    lastPlaybackError = e?.detail ? `${e.message} (${e.detail})` : (e?.message || String(e));
+    throw e;
+  });
+  queueJob = result.catch(() => {});
+  return result;
 }
 export async function remotePause() { ++playGeneration; await ready(); await ctl(["pause"]); }
-export async function remoteResume() { await ready(); await ctl(["activate"]); await ctl(["play"]); }
+export async function remoteResume() { await ready(); if (!authState?.is_active) await ctl(["activate"], 4000); await ctl(["play"], 4000); }
 export async function remoteSeek({ position }) { await ready(); await ctl(["seek", String(Math.max(0, Math.round(position)))]); }
 export async function remoteVolume({ percent }) { await ready(); await ctl(["volume", String(Math.max(0, Math.min(100, Math.round(percent))))]); }
 export async function remoteState() {

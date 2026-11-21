@@ -108,7 +108,7 @@ On a default Windows installation, the destination path is:
 
 - **Platform Support**: This preview currently supports Windows x64 only. Podcasts and automatic Soloist binary updates are not yet implemented.
 - **Development Mode Limits**: Standard Spotify Development Mode restrictions apply, such as inaccessible editorial recommendations and limited access to playlists you neither own nor collaborate on.
-- **Playback Queue**: The queue dispatches up to 100 tracks per batch directly to Soloist via the Spotify Web API. Subsequent queue context is managed by MyGo without generating temporary cloud playlists.
+- **Playback Queue**: Tracks start directly over Soloist's local WebSocket control channel without waiting on cloud device polling; MyGo manages queue progression, shuffle, and repeat without creating temporary cloud playlists.
 - **Native Audio Rendering**: Audio decoding and output are handled entirely by the Soloist engine. MyGo's built-in software normalization, equalizer, and format settings do not apply to the external player.
 - **90-Day Build Expiry**: Official Spotify Soloist preview builds expire **90 days after their build date**. Before expiration, quit MyGo and replace `bin/soloist.exe` with a fresh build from Spotify's download portal. The plugin displays an alert when a build has expired.
 - **Plugin Updates**: Updating the plugin in MyGo may replace the entire plugin folder, including any locally added `bin/soloist.exe`. If the binary is removed after an update, simply copy `soloist.exe` back into `bin/`. Encrypted keys and device pairings are saved outside the plugin folder and remain intact.

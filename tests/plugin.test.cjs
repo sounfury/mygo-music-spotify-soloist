@@ -5,11 +5,66 @@ function stateMachine(){let now=1000;const from=source.indexOf('function onEvent
 test('playback progress interpolates locally and freezes on pause',()=>{const s=stateMachine();s.onEvent({type:'playback_state',status:'playing',item:{decorations:{playback:{duration_ms:60000}}},position:{position_ms:10000,timestamp_ms:999999999,speed:1}});s.tick(1500);assert.equal(s.positionNow(),11500);s.onEvent({type:'playback_changed',status:'paused'});s.tick(3000);assert.equal(s.positionNow(),11500);s.onEvent({type:'position_sync',position:{position_ms:30000,speed:0}});assert.equal(s.positionNow(),30000)});
 // Track changes must reset position and the duration cap; logout clears the old playback.
 test('track transition, volume, device and logout events replace state',()=>{const s=stateMachine();s.onEvent({type:'auth_state',logged_in:true,is_active:true});s.onEvent({type:'playback_state',status:'playing',item:{decorations:{playback:{duration_ms:50000}}},position:{position_ms:10000,speed:1},volume:40});s.onEvent({type:'track_changed',item:{decorations:{playback:{duration_ms:2000}}}});s.tick(3000);assert.equal(s.positionNow(),2000);s.onEvent({type:'volume_changed',volume:65});assert.equal(s.get().volume,65);s.onEvent({type:'device_changed',is_active:false,device_name:'MyGo Soloist'});assert.equal(s.get().is_active,false);assert.equal(s.auth().is_active,false);s.onEvent({type:'auth_state',logged_in:false});assert.equal(s.get(),null)});
-function queueMachine(){const from=source.indexOf('let queueJob = Promise.resolve();'),to=source.indexOf('export async function remoteResume()',from);assert(from>=0&&to>from);const requests=[];let unblock;const gate=new Promise(r=>unblock=r);let readyCalls=0;const c={Date,Math,Promise,Error,authState:{device_name:'MyGo Soloist'},t:s=>s,delay:async()=>{},ready:async()=>{if(++readyCalls===1)await gate},ctl:async()=>{},api:async(method,url,body)=>{if(method==='GET')return {devices:[{id:'device',name:'MyGo Soloist'}]};requests.push(body)}};vm.runInNewContext(source.slice(from,to).replaceAll('export async function','async function')+';globalThis.subject={remotePlay,remotePause}',c);return {...c.subject,requests,unblock}}
+function queueMachine({active=true,playbackState={options:{shuffle:false,repeat:'off'}},ctlFail=null}={}){
+  const from=source.indexOf('let queueJob = Promise.resolve();'),to=source.indexOf('export async function remoteResume()',from);
+  assert(from>=0&&to>from);
+  const commands=[];
+  let unblock;
+  const gate=new Promise(r=>unblock=r);
+  let readyCalls=0;
+  const c={
+    Date,Math,Promise,Error,String,
+    authState:{device_name:'MyGo Soloist',is_active:active},
+    playback:playbackState,
+    lastPlaybackError:'',
+    t:s=>s,
+    ready:async()=>{if(++readyCalls===1)await gate},
+    ctl:async(args)=>{
+      if(ctlFail&&args[0]==='play')throw ctlFail;
+      commands.push(args);
+    },
+  };
+  vm.runInNewContext(source.slice(from,to).replaceAll('export async function','async function')+';globalThis.subject={remotePlay,remotePause,getError:()=>lastPlaybackError}',c);
+  return {...c.subject,commands,unblock};
+}
 // A later selection supersedes a request that is still waiting for the backend.
-test('latest selection supersedes queued playback',async()=>{const q=queueMachine();const first=q.remotePlay({ids:['old']});await Promise.resolve();await Promise.resolve();const second=q.remotePlay({ids:['new']});q.unblock();await Promise.all([first,second]);assert.equal(q.requests.length,1);assert.equal(q.requests[0].uris[0],'spotify:track:new')});
+test('latest selection supersedes queued playback',async()=>{
+  const q=queueMachine();
+  const first=q.remotePlay({ids:['old']});
+  await Promise.resolve();await Promise.resolve();
+  const second=q.remotePlay({ids:['new']});
+  q.unblock();
+  await Promise.all([first,second]);
+  assert.deepEqual(Array.from(q.commands,a=>Array.from(a)),[['play','spotify:track:new']]);
+});
 // Pausing while Soloist starts must not produce a delayed playback request.
-test('pause cancels pending playback',async()=>{const q=queueMachine();const first=q.remotePlay({ids:['old']});await Promise.resolve();await Promise.resolve();await q.remotePause();q.unblock();await first;assert.equal(q.requests.length,0)});
+test('pause cancels pending playback',async()=>{
+  const q=queueMachine();
+  const first=q.remotePlay({ids:['old']});
+  await Promise.resolve();await Promise.resolve();
+  await q.remotePause();
+  q.unblock();
+  await first;
+  assert.deepEqual(Array.from(q.commands,a=>Array.from(a)),[['pause']]);
+});
+test('remotePlay skips redundant activate/shuffle/repeat when active, activates and seeks when needed, and records error details',async()=>{
+  const q=queueMachine({active:false,playbackState:{options:{shuffle:true,repeat:'context'}}});
+  q.unblock();
+  await q.remotePlay({ids:['t0','t1'],start:1,position:12345});
+  assert.deepEqual(Array.from(q.commands,a=>Array.from(a)),[
+    ['activate'],
+    ['play','spotify:track:t1'],
+    ['seek','12345'],
+    ['shuffle','off'],
+    ['repeat','off'],
+  ]);
+  assert.equal(q.getError(),'');
+
+  const failing=queueMachine({ctlFail:Object.assign(new Error('Playback failed.'),{detail:'ws disconnected'})});
+  failing.unblock();
+  await assert.rejects(failing.remotePlay({ids:['t1']}),/Playback failed/);
+  assert.equal(failing.getError(),'Playback failed. (ws disconnected)');
+});
 
 function artistHarness(mockApi){
   const from=source.indexOf('const image = items =>'),to=source.indexOf('export async function liked(',from);
