@@ -264,10 +264,16 @@ function track(v, parent) {
   if (!v?.id || v.type === "episode") return null;
   return { id: v.id, name: v.name, artists: (v.artists || []).map(artistMap), album: albumMap(parent || v.album) || { id: "", name: "" }, duration: v.duration_ms || 0, url: v.external_urls?.spotify, unavailable: v.is_playable === false };
 }
-function playlistMap(p) {
+function playlistMap(p, inUserLibrary = false) {
   if (!p) return null;
   const mine = p.owner?.id === host.storage.get("me") || !!p.collaborative;
-  return { id: p.id, name: p.name, imageUrl: image(p.images), description: p.description, owner: p.owner?.display_name, trackCount: (p.items || p.tracks)?.total || 0, mine, saved: !mine };
+  return { id: p.id, name: p.name, imageUrl: image(p.images), description: p.description, owner: p.owner?.display_name, trackCount: (p.items || p.tracks)?.total || 0, mine, saved: !mine && !!inUserLibrary };
+}
+async function inLibrary(uri) {
+  try {
+    const saved = await api("GET", "/me/library/contains", undefined, { uris: uri });
+    return !!saved?.[0];
+  } catch { return false; }
 }
 async function all(path, query, pick, maxPages = 30) {
   const out = [];
@@ -278,7 +284,7 @@ async function all(path, query, pick, maxPages = 30) {
   return out;
 }
 export async function search({ query, kind, offset = 0 }) {
-  const map = { tracks: track, albums: albumMap, artists: artistMap, playlists: playlistMap };
+  const map = { tracks: track, albums: albumMap, artists: artistMap, playlists: p => playlistMap(p, false) };
   if (!map[kind]) return { more: false };
   const result = await api("GET", "/search", undefined, { q: query, type: kind.slice(0, -1), limit: 10, offset });
   const page = result[kind]; return { [kind]: (page?.items || []).map(v => map[kind](v)).filter(Boolean), more: !!page?.next };
@@ -294,17 +300,59 @@ export async function home() {
 }
 export async function playlists() {
   if (!host.storage.get("session")) return [];
-  return all("/me/playlists", { limit: 50 }, playlistMap);
+  return all("/me/playlists", { limit: 50 }, p => playlistMap(p, true));
 }
 export async function playlist({ id }) {
-  const meta = await api("GET", `/playlists/${encodeURIComponent(id)}`);
-  const tracks = await all(`/playlists/${encodeURIComponent(id)}/items`, { limit: 50 }, v => track(v.item || v.track));
-  return { ...playlistMap(meta), tracks, trackCount: tracks.length };
+  const encodedId = encodeURIComponent(id);
+  const [meta, tracks] = await Promise.all([
+    api("GET", `/playlists/${encodedId}`),
+    all(`/playlists/${encodedId}/items`, { limit: 50 }, v => track(v.item || v.track)),
+  ]);
+  const mapped = playlistMap(meta, false);
+  const saved = mapped && !mapped.mine ? await inLibrary(`spotify:playlist:${id}`) : false;
+  return { ...mapped, saved, tracks, trackCount: tracks.length };
+}
+export async function createPlaylist({ name }) {
+  const title = String(name || "").trim();
+  if (!title) throw new Error(t("Enter a playlist name."));
+  const created = await api("POST", "/me/playlists", { name: title });
+  return { ...playlistMap(created, false), mine: true, saved: false };
+}
+export async function renamePlaylist({ id, name }) {
+  const title = String(name || "").trim();
+  if (!title) throw new Error(t("Enter a playlist name."));
+  await api("PUT", `/playlists/${encodeURIComponent(id)}`, { name: title });
+}
+export async function deletePlaylist({ id }) {
+  await api("DELETE", "/me/library", undefined, { uris: `spotify:playlist:${id}` });
+}
+export async function savePlaylist({ id, on }) {
+  await api(on ? "PUT" : "DELETE", "/me/library", undefined, { uris: `spotify:playlist:${id}` });
+}
+export async function addToPlaylist({ id, trackIds = [] }) {
+  const uris = trackIds.filter(Boolean).map(tid => `spotify:track:${tid}`);
+  for (let i = 0; i < uris.length; i += 100) {
+    await api("POST", `/playlists/${encodeURIComponent(id)}/items`, { uris: uris.slice(i, i + 100) });
+  }
+}
+export async function removeFromPlaylist({ id, trackIds = [] }) {
+  const items = trackIds.filter(Boolean).map(tid => ({ uri: `spotify:track:${tid}` }));
+  for (let i = 0; i < items.length; i += 100) {
+    await api("DELETE", `/playlists/${encodeURIComponent(id)}/items`, { items: items.slice(i, i + 100) });
+  }
+}
+export async function movePlaylistTrack({ id, from, to }) {
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from < 0 || to < 0 || from === to) return;
+  await api("PUT", `/playlists/${encodeURIComponent(id)}/items`, {
+    range_start: from,
+    insert_before: from < to ? to + 1 : to,
+    range_length: 1,
+  });
 }
 export async function album({ id }) {
-  const a = await api("GET", `/albums/${encodeURIComponent(id)}`);
+  const [a, saved] = await Promise.all([api("GET", `/albums/${encodeURIComponent(id)}`), inLibrary(`spotify:album:${id}`)]);
   const rest = a.tracks.next ? await all(a.tracks.next, undefined, v => track(v, a)) : [];
-  return { album: albumMap(a), tracks: [...a.tracks.items.map(v => track(v, a)).filter(Boolean), ...rest] };
+  return { album: { ...albumMap(a), saved }, tracks: [...a.tracks.items.map(v => track(v, a)).filter(Boolean), ...rest] };
 }
 export async function artist({ id }) {
   const encodedId = encodeURIComponent(id);
@@ -316,13 +364,7 @@ export async function artist({ id }) {
       return all(`/artists/${encodedId}/albums`, { limit: 10 }, albumMap, 10);
     }
   };
-  const checkFollowing = async () => {
-    try {
-      const saved = await api("GET", "/me/library/contains", undefined, { uris: `spotify:artist:${id}` });
-      return !!saved?.[0];
-    } catch { return false; }
-  };
-  const [a, records, following] = await Promise.all([api("GET", `/artists/${encodedId}`), fetchAlbums(), checkFollowing()]);
+  const [a, records, following] = await Promise.all([api("GET", `/artists/${encodedId}`), fetchAlbums(), inLibrary(`spotify:artist:${id}`)]);
   const safeName = String(a.name || "").replace(/"/g, "").trim();
   const tracks = new Map();
   if (safeName) {

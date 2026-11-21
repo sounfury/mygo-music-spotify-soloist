@@ -15,8 +15,8 @@ function artistHarness(mockApi){
   const from=source.indexOf('const image = items =>'),to=source.indexOf('export async function liked(',from);
   assert(from>=0&&to>from);
   const code=source.slice(from,to).replaceAll('export async function','async function');
-  const c={Map,Promise,Error,String,encodeURIComponent,host:{storage:{get:()=>'me-1'}},api:mockApi};
-  vm.runInNewContext(code+';globalThis.subject={artist,followArtist}',c);
+  const c={Map,Promise,Error,String,Number,encodeURIComponent,t:s=>s,host:{storage:{get:k=>k==='me'?'me-1':k==='session'?{access:'tok'}:undefined}},api:mockApi};
+  vm.runInNewContext(code+';globalThis.subject={search,playlists,playlist,createPlaylist,renamePlaylist,deletePlaylist,savePlaylist,addToPlaylist,removeFromPlaylist,movePlaylistTrack,album,artist,followArtist}',c);
   return c.subject;
 }
 test('artist page uses limit <= 10, strips quotes, paginates search and tolerates following error',async()=>{
@@ -300,4 +300,75 @@ test('spawnProcess classifies permission vs missing soloist.exe and signOut bloc
   releaseFetch();
   await assert.rejects(pending,e=>e.code==='signIn');
   assert.equal(store.has('session'),false,'stale refresh must not restore signed-out session');
+});
+
+test('playlist CRUD, batch item edits, move index translation, and accurate library saved state',async()=>{
+  const calls=[];
+  const subject=artistHarness(async(method,url,body,query)=>{
+    calls.push({method,url,body,query});
+    if(method==='POST'&&url==='/me/playlists')return {id:'pl-new',name:body.name,owner:{id:'me-1',display_name:'Me'},items:{total:0}};
+    if(method==='GET'&&url==='/search')return {playlists:{items:[{id:'pl-other',name:'Stranger Mix',owner:{id:'u2',display_name:'Other'},items:{total:5}}],next:null}};
+    if(method==='GET'&&url==='/me/playlists')return {items:[
+      {id:'pl-mine',name:'Mine',owner:{id:'me-1',display_name:'Me'},items:{total:1}},
+      {id:'pl-saved',name:'Saved',owner:{id:'u2',display_name:'Other'},items:{total:2}},
+    ],next:null};
+    if(method==='GET'&&url==='/playlists/pl-other')return {id:'pl-other',name:'Stranger Mix',owner:{id:'u2',display_name:'Other'},items:{total:1}};
+    if(method==='GET'&&url==='/playlists/pl-other/items')return {items:[{item:{id:'t1',name:'S1',artists:[{id:'a1',name:'A1'}],album:{id:'alb1',name:'Alb1'},duration_ms:1000}}],next:null};
+    if(method==='GET'&&url==='/albums/alb1')return {id:'alb1',name:'Alb1',artists:[{id:'a1',name:'A1'}],tracks:{items:[{id:'t1',name:'S1',artists:[{id:'a1',name:'A1'}],duration_ms:1000}],next:null}};
+    if(method==='GET'&&url==='/me/library/contains')return [query.uris==='spotify:album:alb1'];
+    return {};
+  });
+
+  await assert.rejects(subject.createPlaylist({name:'   '}),/Enter a playlist name/);
+  const created=await subject.createPlaylist({name:'  Road Trip  '});
+  assert.equal(created.id,'pl-new');
+  assert.equal(created.name,'Road Trip');
+  assert.equal(created.mine,true);
+  assert.equal(created.saved,false);
+
+  await subject.renamePlaylist({id:'pl-new',name:'  Night Drive  '});
+  await subject.deletePlaylist({id:'pl-new'});
+  await subject.savePlaylist({id:'pl-other',on:true});
+  await subject.savePlaylist({id:'pl-other',on:false});
+
+  const ids105=Array.from({length:105},(_,i)=>`t${i}`);
+  await subject.addToPlaylist({id:'pl-new',trackIds:ids105});
+  await subject.removeFromPlaylist({id:'pl-new',trackIds:ids105});
+
+  await subject.movePlaylistTrack({id:'pl-new',from:1,to:0}); // move up -> insert_before = 0
+  await subject.movePlaylistTrack({id:'pl-new',from:0,to:3}); // move down -> insert_before = 4
+  await subject.movePlaylistTrack({id:'pl-new',from:2,to:2}); // no-op
+
+  const searched=await subject.search({query:'mix',kind:'playlists'});
+  assert.equal(searched.playlists[0].saved,false,'searched playlist must not default to saved=true');
+
+  const libPls=await subject.playlists();
+  assert.equal(libPls[0].mine,true);
+  assert.equal(libPls[0].saved,false);
+  assert.equal(libPls[1].mine,false);
+  assert.equal(libPls[1].saved,true);
+
+  const plDetail=await subject.playlist({id:'pl-other'});
+  assert.equal(plDetail.saved,false);
+
+  const albDetail=await subject.album({id:'alb1'});
+  assert.equal(albDetail.album.saved,true);
+
+  const addCalls=calls.filter(c=>c.method==='POST'&&c.url==='/playlists/pl-new/items');
+  assert.equal(addCalls.length,2);
+  assert.equal(addCalls[0].body.uris.length,100);
+  assert.equal(addCalls[1].body.uris.length,5);
+
+  const rmCalls=calls.filter(c=>c.method==='DELETE'&&c.url==='/playlists/pl-new/items');
+  assert.equal(rmCalls.length,2);
+  assert.equal(rmCalls[0].body.items.length,100);
+  assert.equal(rmCalls[0].body.items[0].uri,'spotify:track:t0');
+  assert.equal(rmCalls[1].body.items.length,5);
+
+  const moveCalls=calls.filter(c=>c.method==='PUT'&&c.url==='/playlists/pl-new/items');
+  assert.equal(moveCalls.length,2);
+  assert.equal(moveCalls[0].body.range_start,1);
+  assert.equal(moveCalls[0].body.insert_before,0);
+  assert.equal(moveCalls[1].body.range_start,0);
+  assert.equal(moveCalls[1].body.insert_before,4);
 });

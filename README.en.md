@@ -12,7 +12,7 @@ A Windows x64 plugin for [MyGo Music](https://github.com/egoist/mygo-music) that
 ## Features
 
 - **Official Native Audio Quality**: Audio is fetched, decoded, and output directly by Spotify Soloist with zero transcoding or third-party stream substitution.
-- **Full Library Browsing**: Browse personalized home recommendations, global search (tracks, albums, artists, playlists), your playlists, liked songs, and saved albums.
+- **Full Library & Playlist Management**: Browse personalized home recommendations, global search (tracks, albums, artists, playlists), your playlists, liked songs, and saved albums; create, rename, delete, and save playlists, add/remove tracks in batches, and reorder playlist tracks.
 - **Rich Details & Bilingual Lyrics**: Dedicated album and artist pages (including artist follow/unfollow), with concurrent synchronized lyrics lookup across **LRCLIB, NetEase Cloud Music, and QQ Music**—prioritizing original + Chinese translation with in-memory caching.
 - **Seamless Playback Controls**: Play, pause, resume, seek, adjust volume, and integrate smoothly with MyGo's playback queue.
 - **Silent Background Warmup on Mount**: Automatically warms up Soloist silently in the background as soon as the plugin mounts (without stealing active playback from other devices) and restores saved Spotify Connect pairings, minimizing first-track cold-start latency.
@@ -107,7 +107,7 @@ On a default Windows installation, the destination path is:
 
 ## Limitations & Updates
 
-- **Platform Support**: This preview currently supports Windows x64 only. Podcasts, in-app playlist editing, and automatic Soloist binary updates are not yet implemented.
+- **Platform Support**: This preview currently supports Windows x64 only. Podcasts and automatic Soloist binary updates are not yet implemented.
 - **Development Mode Limits**: Standard Spotify Development Mode restrictions apply, such as inaccessible editorial recommendations and limited access to playlists you neither own nor collaborate on.
 - **Playback Queue**: The queue dispatches up to 100 tracks per batch directly to Soloist via the Spotify Web API. Subsequent queue context is managed by MyGo without generating temporary cloud playlists.
 - **Native Audio Rendering**: Audio decoding and output are handled entirely by the Soloist engine. MyGo's built-in software normalization, equalizer, and format settings do not apply to the external player.

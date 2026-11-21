@@ -11,6 +11,7 @@
   "Enter your Soloist API Key in the plugin settings, or save it with scripts/soloist-host.ps1.": "请在插件设置中填写 Soloist API Key，或使用 scripts/soloist-host.ps1 本地脚本保存。",
   "Plugin data directory is unavailable. Restart MyGo Music and try again.": "无法访问插件数据目录，请重启 MyGo Music 后重试。",
   "Enter your Spotify Client ID in the plugin settings.": "请在插件设置中填写 Spotify Client ID。",
+  "Enter a playlist name.": "请输入歌单名称。",
   "Sign in to Spotify to load your music library.": "请登录 Spotify 以加载音乐库。",
   "Invalid Spotify authorization response. Sign in again.": "Spotify 授权响应无效，请重新登录。",
   "Spotify authorization expired or was refused. Sign in again.": "Spotify 授权已过期或被拒绝，请重新登录。",

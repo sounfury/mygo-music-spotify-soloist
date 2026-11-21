@@ -78,9 +78,10 @@
    - `access()` 使用 `authGeneration` 代际隔离与单飞 `refreshing` 合并并发 Token 刷新，确保退出登录或更换 `Client ID` 后，进行中的旧刷新不会把旧凭据写回 `host.storage`；`api()` 自动处理 `401` 刷新重试、`403 PREMIUM_REQUIRED`、`429` 限流与请求超时。
    - `spawnProcess()` 统一拦截并分类进程启动异常（未授权进程权限、缺少 `bin/soloist.exe`、通用启动失败），均通过 `problem(code, message)` 返回带 `setup`/`signIn` 错误码的本地化提示。
 
-2. **曲库接口（Catalog Endpoints）**
-   - 统一通过 `track()` / `albumMap()` / `artistMap()` / `playlistMap()` 映射为 MyGo 数据结构。
-   - `artist()` 遵循 Development Mode 限制（`/artists/{id}/albums` 使用 `limit: 10`，遇到 `400` 时去掉 `include_groups` 重试），搜索艺人曲目时剥离引号并分页去重；`followArtist()` 与 `artist.following` 查询对旧 Token 缺少 `user-follow-*` 权限时的 `403` 自动降级。
+2. **曲库与歌单编辑接口（Catalog Endpoints）**
+   - 统一通过 `track()` / `albumMap()` / `artistMap()` / `playlistMap()` 映射为 MyGo 数据结构，并通过 `inLibrary(uri)` 容错查询 `/me/library/contains`，确保专辑详情 `saved`、歌单详情 `saved` 与艺人 `following` 状态准确（且搜索出的陌生歌单不会误标 `saved: true`）。
+   - 完整实现歌单与资料库交互：`createPlaylist`（`POST /me/playlists`）、`renamePlaylist`（`PUT /playlists/{id}`）、`deletePlaylist` / `savePlaylist`（`/me/library`）、`addToPlaylist` / `removeFromPlaylist`（`/playlists/{id}/items`，按 100 首分批）、`movePlaylistTrack`（将 MyGo 目标索引转换为 Spotify `insert_before = from < to ? to + 1 : to`）。
+   - `artist()` 遵循 Development Mode 限制（`/artists/{id}/albums` 使用 `limit: 10`，遇到 `400` 时去掉 `include_groups` 重试），搜索艺人曲目时剥离引号并分页去重。
 
 3. **三源并发双语歌词（Synchronized Bilingual Lyrics）**
    - `lyrics()` 通过 `Promise.allSettled` 并发查询三路数据源：
@@ -106,7 +107,7 @@
 node --check index.js
 node --test tests/plugin.test.cjs
 ```
-当前单测覆盖：本地进度插值与事件状态机、队列代际抢占与暂停取消、艺人页分页与权限降级、歌词解码清洗与候选打分、三源并发与缓存、挂载后台预热与并发去重、纯 JS PKCE（RFC 7636/NIST 向量）、API Key UI 直填与热切换隔离、`spawnProcess` 错误分类以及 `signOut` 刷新代际隔离。
+当前单测覆盖：本地进度插值与事件状态机、队列代际抢占与暂停取消、艺人页分页与权限降级、歌单 CRUD/分批增删/排序索引换算与资料库收藏状态、歌词解码清洗与候选打分、三源并发与缓存、挂载后台预热与并发去重、纯 JS PKCE（RFC 7636/NIST 向量）、API Key UI 直填与热切换隔离、`spawnProcess` 错误分类以及 `signOut` 刷新代际隔离。
 
 ### 修改检查清单
 - **保持单测锚点**：`tests/plugin.test.cjs` 通过字符串定位从 `index.js` 切片在 `node:vm` 中执行（依赖 `const image = items =>`、`export async function liked(`、`const LYRIC_TIMEOUT =`、`// The desktop app owns these child processes`、`const EXE = "bin/soloist.exe";`、`function onEvent(`、`async function watch(`、`async function ready()`、`let queueJob = Promise.resolve();`、`export async function remoteResume()`、`// Start Soloist in the background`）。调整结构时同步确认测试通过。
