@@ -133,18 +133,27 @@ function spawnProcess(program, args) {
     throw problem("setup", "Could not start the Soloist helper. Reinstall this plugin and its local Soloist executable.");
   }
 }
+function killProcess(p) { try { p?.kill?.(); } catch {} }
+function timeoutError() { return new Error(t("Soloist command timed out.")); }
+async function within(task, ms) {
+  let timer;
+  try {
+    return await Promise.race([task, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(timeoutError()), Math.max(0, ms));
+    })]);
+  } finally { clearTimeout(timer); }
+}
 async function processResult(program, args, timeout = 15000) {
   const p = spawnProcess(program, args);
-  p.closeStdin();
-  let expired = false;
-  const timer = setTimeout(() => { expired = true; p.kill(); }, timeout);
   try {
-    const lines = [];
-    for (let line; (line = await p.readLine()) !== null;) lines.push(line);
-    const code = await p.wait();
-    if (expired) throw new Error(t("Soloist command timed out."));
-    return { code, output: lines.join("\n"), error: p.errorOutput() };
-  } finally { clearTimeout(timer); }
+    p.closeStdin();
+    return await within((async () => {
+      const lines = [];
+      for (let line; (line = await p.readLine()) !== null;) lines.push(line);
+      const code = await p.wait();
+      return { code, output: lines.join("\n"), error: code && args[0] === "ctl" ? p.errorOutput() : "" };
+    })(), timeout);
+  } catch (e) { killProcess(p); throw e; }
 }
 async function helper(action) {
   const r = await processResult("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `${host.dir}/scripts/soloist-host.ps1`, "-Action", action]);
@@ -248,7 +257,7 @@ export function setSetting({ key, value }) {
   if (key === "clientId") signOut();
   if (key === "soloistApiKey") {
     stopSoloist();
-    if (String(value || "").trim()) warmupSoloist();
+    warmupSoloist();
   }
 }
 export async function account() {
@@ -612,65 +621,263 @@ export async function lyrics({ id }) {
 // The desktop app owns these child processes; MyGo hides their Windows consoles.
 const EXE = "bin/soloist.exe";
 let configPromise = null, startPromise = null, startGeneration = 0, daemon = null, watcher = null;
-let authState = null, playback = null, anchoredAt = 0, backendError = null, lastPlaybackError = "";
+let authState = null, playback = null, anchoredAt = 0, backendError = null;
+let reconnectTimer = null, reconnectDelay = 250;
+let managed = { id: "", seen: false, replacement: "", pause: null };
+let transitionPending = false, playbackRevision = 0, eventRevision = 0, failedPlay = null;
+let sessionRevision = 0, detachedTrackId = "", signedOutAt = 0;
+let lastPlaybackError = host.storage?.get("lastPlaybackError") || "";
+function playbackError(message) {
+  if (message === lastPlaybackError) return;
+  lastPlaybackError = message;
+  try {
+    if (message) host.storage?.set("lastPlaybackError", message);
+    else host.storage?.remove("lastPlaybackError");
+  } catch {} // A storage failure must not turn an accepted play into a failed load.
+}
 async function resolveConfig() {
   const directKey = (host.setting?.("soloistApiKey") || "").trim();
   if (directKey) return { key: directKey, source: "setting" };
-  const c = await helper("config");
-  return { ...c, source: "dpapi" };
+  return { ...(await helper("config")), source: "dpapi" };
 }
 const dataArgs = c => (c?.dataDir ? ["-D", c.dataDir] : []);
-const config = () => configPromise ||= resolveConfig().catch(e => { configPromise = null; throw e; });
+function config() {
+  if (!configPromise) {
+    const pending = resolveConfig().catch(e => {
+      if (configPromise === pending) configPromise = null;
+      throw e;
+    });
+    configPromise = pending;
+  }
+  return configPromise;
+}
+function manage(trackId = "") {
+  managed = { id: trackId, seen: false, replacement: "", pause: null };
+  transitionPending = false;
+}
+function forgetSnapshot() {
+  authState = null;
+  playback = null;
+  anchoredAt = 0;
+  transitionPending = false;
+  ++playbackRevision;
+}
+function disconnect() {
+  if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnectDelay = 250;
+  const old = watcher;
+  watcher = null;
+  killProcess(old);
+  forgetSnapshot();
+  detachedTrackId = "";
+  manage();
+  failedPlay = null;
+}
 function stopSoloist() {
   ++startGeneration;
-  if (typeof playGeneration === "number") ++playGeneration;
-  const oldWatcher = watcher, oldDaemon = daemon;
-  startPromise = null; watcher = null; daemon = null; authState = null; playback = null; anchoredAt = 0; backendError = null; lastPlaybackError = ""; configPromise = null;
-  try { oldWatcher?.kill?.(); } catch {}
-  try { oldDaemon?.kill?.(); } catch {}
+  startPromise = null;
+  configPromise = null;
+  backendError = null;
+  disconnect();
+  const old = daemon;
+  daemon = null;
+  killProcess(old);
 }
 function onEvent(e) {
   switch (e.type) {
-    case "auth_state": authState = e; if (!e.logged_in) playback = null; break;
-    case "playback_state": playback = e; anchoredAt = Date.now(); break;
-    case "track_changed": if (playback) { playback.item = e.item; playback.position = { position_ms: 0, speed: playback.status === "playing" ? 1 : 0 }; anchoredAt = Date.now(); } break;
-    case "playback_changed": if (playback) { anchorPosition(); playback.status = e.status; playback.position.speed = e.status === "playing" ? 1 : 0; } break;
+    case "auth_state":
+      if (!e.logged_in && (!authState || authState.logged_in)) {
+        ++sessionRevision;
+        failedPlay = null;
+        detachedTrackId = "";
+        signedOutAt = Date.now();
+      }
+      authState = e;
+      if (!e.logged_in || !e.is_active) {
+        if (!e.logged_in) playback = null;
+        else if (playback) playback.is_active = false;
+        if (managed.seen && e.logged_in && !e.is_active) detachedTrackId = managed.id;
+        if (managed.seen || !e.logged_in) manage();
+      }
+      break;
+    case "playback_state": {
+      const id = trackIdOf(e.item);
+      playback = e;
+      ++playbackRevision;
+      anchoredAt = Date.now();
+      transitionPending = false;
+      if (authState && typeof e.is_active === "boolean") authState.is_active = e.is_active;
+      if (!e.is_active || authState?.logged_in === false) {
+        if (managed.seen) { detachedTrackId = managed.id; manage(); }
+      } else if (managed.id && id === managed.id) {
+        managed.seen = true;
+        managed.replacement = "";
+        managed.pause = null;
+      } else if (managed.seen && id) {
+        // The direct track context survives Spotify autoplay. A different context can be
+        // a phone selection even in the last second of the managed track.
+        if (e.context?.uri === `spotify:track:${managed.id}` || (!e.context?.uri && managed.replacement === id)) {
+          if (managed.replacement !== id) {
+            managed.replacement = id;
+            managed.pause = null;
+          }
+        } else manage();
+      }
+      break;
+    }
+    case "track_changed":
+      if (playback) {
+        // This delta has no new context/actions. Request a full snapshot before
+        // returning a different track to MyGo or pausing a possible replacement.
+        transitionPending ||= !!managed.id && trackIdOf(e.item) !== trackIdOf(playback.item);
+        playback.item = e.item;
+        playback.available_actions = {};
+        playback.position = { position_ms: 0, speed: playback.status === "playing" ? 1 : 0 };
+        anchoredAt = Date.now();
+      }
+      break;
+    case "playback_changed":
+      if (playback) { anchorPosition(); playback.status = e.status; playback.position.speed = e.status === "playing" ? 1 : 0; }
+      break;
     case "position_sync": if (playback) { playback.position = e.position; anchoredAt = Date.now(); } break;
     case "volume_changed": if (playback) playback.volume = e.volume; break;
-    case "device_changed": if (authState) Object.assign(authState, { is_active: e.is_active, device_name: e.device_name }); if (playback) playback.is_active = e.is_active; break;
+    case "device_changed":
+      if (authState) Object.assign(authState, { is_active: e.is_active, device_name: e.device_name });
+      if (playback) playback.is_active = e.is_active;
+      if (e.is_active === false) {
+        if (managed.seen) detachedTrackId = managed.id;
+        manage();
+        failedPlay = null;
+      }
+      break;
   }
+  ++eventRevision;
+  if (managed.replacement && !managed.pause && targetPlaying(managed.replacement)) {
+    pauseReplacement(managed.id, managed.replacement).catch(() => {});
+  }
+  if (failedPlay) {
+    const delta = (e.type === "track_changed" && trackIdOf(e.item) === failedPlay.id) ||
+      (e.type === "playback_changed" && e.status === "playing");
+    if (delta || (targetPlaying(failedPlay.id) && playbackRevision > failedPlay.revision)) silenceFailedPlay(delta);
+  }
+}
+function trackIdOf(item) { return item?.uri?.replace(/^spotify:track:/, "") || ""; }
+function targetPlaying(id) {
+  return !transitionPending && playback?.is_active && authState?.logged_in && trackIdOf(playback.item) === id &&
+    (playback.status === "playing" || playback.status === "buffering");
+}
+function pauseReplacement(trackId, replacement) {
+  if (managed.pause) return managed.pause;
+  if (!targetPlaying(replacement)) return Promise.resolve();
+  const task = enqueue(async (current, deadline) => {
+    if (current() && managed.id === trackId && managed.replacement === replacement && targetPlaying(replacement)) {
+      await ctl(["pause"], budget(deadline, 3000));
+    }
+  }).catch(e => {
+    if (managed.pause === task) managed.pause = null;
+    throw e;
+  });
+  managed.pause = task;
+  return task;
+}
+function silenceFailedPlay(probe) {
+  const failed = failedPlay;
+  if (failed.pending || Date.now() > failed.until) return;
+  failed.pending = true;
+  enqueue(async (current, deadline) => {
+    try {
+      if (probe && current() && failedPlay === failed) await readSnapshot(current, deadline);
+      if (current() && failedPlay === failed && Date.now() <= failed.until && targetPlaying(failed.id)) {
+        try { await ctl(["pause"], budget(deadline, 3000)); }
+        catch (e) {
+          await readSnapshot(current, deadline);
+          if (current() && failedPlay === failed && targetPlaying(failed.id)) await ctl(["pause"], budget(deadline, 3000));
+        }
+        if (failedPlay === failed) failedPlay = null;
+      }
+    } finally { failed.pending = false; }
+  }, false).catch(() => {
+    failed.pending = false;
+    if (failedPlay !== failed) return;
+    const warning = t("Soloist could not confirm that late playback was paused.");
+    if (!lastPlaybackError.includes(warning)) playbackError([lastPlaybackError, warning].filter(Boolean).join(" "));
+  });
 }
 function positionNow() {
   if (!playback) return 0;
   const p = playback.position || {};
   const duration = playback.item?.decorations?.playback?.duration_ms || Number.MAX_SAFE_INTEGER;
-  return Math.max(0, Math.min(duration, (p.position_ms || 0) + Math.max(0, Date.now() - anchoredAt) * (p.speed || 0)));
+  const elapsed = playback.status === "playing" ? Math.max(0, Date.now() - anchoredAt) * (p.speed || 0) : 0;
+  return Math.max(0, Math.min(duration, (p.position_ms || 0) + elapsed));
 }
 function anchorPosition() { if (playback) { playback.position = { ...playback.position, position_ms: positionNow() }; anchoredAt = Date.now(); } }
 async function watch(c) {
   if (watcher) return;
-  const p = spawnProcess(EXE, ["ctl", "trace", ...dataArgs(c)]); watcher = p; p.closeStdin();
+  const runId = startGeneration;
+  const p = spawnProcess(EXE, ["ctl", "trace", ...dataArgs(c)]);
+  watcher = p;
+  const connectedAt = Date.now();
   (async () => {
     try {
-      for (let line; (line = await p.readLine()) !== null;) {
-        if (watcher !== p) break;
-        const at = line.indexOf("{"); if (at < 0) continue;
-        try { onEvent(JSON.parse(line.slice(at))); } catch {}
+      p.closeStdin();
+      for (let line; (line = await p.readLine()) !== null && watcher === p;) {
+        const at = line.indexOf("{");
+        if (at < 0) continue;
+        let e;
+        try { e = JSON.parse(line.slice(at)); } catch { continue; }
+        onEvent(e);
       }
-    } finally { if (watcher === p) { watcher = null; authState = null; playback = null; } }
+    } finally {
+      if (watcher === p) {
+        watcher = null;
+        killProcess(p);
+        forgetSnapshot();
+        if (Date.now() - connectedAt >= 5000) reconnectDelay = 250;
+        reconnect();
+      }
+    }
   })().catch(() => {});
+  function reconnect() {
+    if (runId !== startGeneration || backendError || reconnectTimer !== null) return;
+    const timer = setTimeout(() => {
+      if (reconnectTimer !== timer || runId !== startGeneration) return;
+      reconnectTimer = null;
+      if (!backendError && !watcher) watch(c).catch(reconnect);
+    }, reconnectDelay);
+    reconnectTimer = timer;
+    reconnectDelay = Math.min(5000, reconnectDelay * 2);
+  }
 }
-async function ctl(args, timeout) {
-  const c = await config(); const r = await processResult(EXE, ["ctl", ...args, ...dataArgs(c)], timeout);
+async function ctl(args, timeout = 5000) {
+  const runId = startGeneration;
+  const c = await config();
+  if (runId !== startGeneration) throw configurationChanged();
+  let r;
+  try { r = await processResult(EXE, ["ctl", ...args, ...dataArgs(c)], timeout); }
+  catch (e) {
+    if (e.code) throw e;
+    const reason = e.message === t("Soloist command timed out.") ? e.message : t("Soloist command failed.");
+    throw new Error(`${reason} (${args[0]})`);
+  }
   if (r.code) {
-    const detail = String(r.error || r.output || "").trim().split(/\r?\n/)[0];
-    if (r.code === 3 && !authState?.logged_in) throw problem("setup", "Not paired: select MyGo Soloist in Spotify.");
-    const err = new Error(t("Playback failed. Open Playback Status for details."));
-    if (detail) err.detail = detail;
+    if (r.code === 3 && !authState?.logged_in) throw new Error(t("Not paired: select MyGo Soloist in Spotify."));
+    // Classify locally. The raw CLI output can contain connection details.
+    const detail = String(r.error || r.output || "");
+    const inactive = /not active|inactive device/i.test(detail);
+    const unavailable = /not ready|unavailable action|not available/i.test(detail);
+    let reason = t("Soloist command failed.");
+    if (inactive) reason = t("Soloist is not the active device.");
+    else if (unavailable) reason = t("This playback action is not available yet.");
+    else if (/disconnect|connection refused|connection closed|could not connect/i.test(detail)) reason = t("Soloist's local connection was interrupted.");
+    const err = new Error(`${reason} (${args[0]}, ${r.code})`);
+    err.inactive = inactive;
+    err.actionUnavailable = inactive || unavailable;
     throw err;
   }
   return r.output;
 }
+function configurationChanged() { return new Error(t("Soloist configuration changed. Try again.")); }
 async function ensureSoloist() {
   if (watcher && authState) return authState;
   if (startPromise) return startPromise;
@@ -683,8 +890,8 @@ async function ensureSoloist() {
     const statusArgs = ["ctl", "status", ...dataArgs(c)];
     const status = await processResult(EXE, statusArgs, 6000);
     if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
-    if (status.code !== 0 || !/running \(pid/.test(status.output)) {
-      authState = null; playback = null; backendError = null;
+    if (!daemon && (status.code !== 0 || !/running \(pid/.test(status.output))) {
+      disconnect();
       const daemonArgs = [
         "--device-name", "MyGo Soloist",
         "--api-key", c.key,
@@ -694,12 +901,13 @@ async function ensureSoloist() {
         "--ws", "127.0.0.1:0",
       ];
       const p = spawnProcess(EXE, daemonArgs);
-      daemon = p; p.closeStdin();
+      daemon = p;
+      try { p.closeStdin(); } catch (e) { daemon = null; killProcess(p); throw e; }
       // Drain stdout so the host's reader never blocks. Do not log credentials.
       (async () => { while (await p.readLine() !== null) {} })().catch(() => {});
-      p.wait().then(code => {
+      p.wait().catch(() => -1).then(code => {
         if (daemon !== p) return;
-        daemon = null; authState = null; playback = null;
+        daemon = null; ++sessionRevision; disconnect();
         backendError = code === 10 ? problem("setup", "Soloist expired. Download a new Windows build from Spotify.") : new Error(t("Soloist stopped. Check its installation, API key and pairing."));
       });
       let started = false;
@@ -707,7 +915,11 @@ async function ensureSoloist() {
       while (Date.now() < until) {
         if (runId !== startGeneration) { try { p.kill?.(); } catch {} throw new Error(t("Soloist configuration changed. Try again.")); }
         if (backendError) throw backendError;
-        const r = await processResult(EXE, statusArgs, 3000);
+        let r;
+        try { r = await processResult(EXE, statusArgs, 3000); } catch (e) {
+          if (daemon === p) { daemon = null; killProcess(p); }
+          throw backendError || e;
+        }
         if (r.code === 0 && /running \(pid/.test(r.output)) { started = true; break; }
         await delay(250);
       }
@@ -720,12 +932,17 @@ async function ensureSoloist() {
     const until = Date.now() + 10000;
     while (!authState && Date.now() < until && !backendError) {
       if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
-      if (!watcher) await watch(c);
+      if (!watcher && reconnectTimer === null) await watch(c);
       await delay(200);
     }
     if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
     if (backendError) throw backendError;
-    if (!authState) throw new Error(t("Soloist did not provide its local connection state."));
+    if (!authState) {
+      const stalled = watcher;
+      watcher = null;
+      killProcess(stalled);
+      throw new Error(t("Soloist did not provide its local connection state."));
+    }
     return authState;
   })().finally(() => { if (startPromise === promise) startPromise = null; });
   startPromise = promise;
@@ -736,64 +953,222 @@ function warmupSoloist() {
   ensureSoloist().catch(() => {});
 }
 async function ready() {
-  const state = await ensureSoloist();
-  if (!state.logged_in) throw problem("setup", "Not paired: select MyGo Soloist in Spotify.");
+  const epoch = startGeneration;
+  await ensureSoloist();
+  while (authState && !authState.logged_in && Date.now() - signedOutAt < 1500) await delay(100);
+  if (epoch !== startGeneration) throw configurationChanged();
+  if (!authState) throw backendError || new Error(t("Soloist did not provide its local connection state."));
+  if (!authState.logged_in) throw new Error(t("Not paired: select MyGo Soloist in Spotify."));
 }
 export async function browse({ page }) {
   if (page !== "soloist") return { title: "Spotify Soloist", sections: [] };
   let description;
   try {
-    const a = await ensureSoloist();
+    const a = await within(ensureSoloist(), 5000);
     description = a.logged_in ? t("Paired and ready. Soloist runs without a terminal window when started by this plugin.") : t("Waiting for pairing: select MyGo Soloist in the Spotify app on your phone.");
   } catch (e) { description = e.message; }
   const sections = [{ title: t("Official Spotify audio"), empty: t("Soloist handles playback. Use MyGo Music to select songs and control playback. Keep this local API bound to 127.0.0.1.") }];
   if (lastPlaybackError) sections.unshift({ title: t("Last Playback Error"), empty: lastPlaybackError });
   return { title: t("Playback Status"), description, sections };
 }
-// Play directly via local Soloist WebSocket CLI for low latency; MyGo manages queue progression.
+// MyGo gives plugin calls 30 seconds, including time spent behind another command.
 let queueJob = Promise.resolve();
 let playGeneration = 0;
-export async function remotePlay({ ids, start = 0, position = 0 }) {
-  const generation = ++playGeneration;
-  const deadline = Date.now() + 25000;
-  const current = () => generation === playGeneration && Date.now() < deadline;
-  const run = async () => {
+function enqueue(run, report = true, generation = playGeneration) {
+  const epoch = startGeneration, deadline = Date.now() + 26000;
+  let expired = false, session = null;
+  function current() {
+    if (epoch !== startGeneration) throw configurationChanged();
+    if (session !== null && session !== sessionRevision) throw backendError || new Error(t("Not paired: select MyGo Soloist in Spotify."));
+    return !expired && (generation === null || generation === playGeneration);
+  }
+  const job = queueJob.then(async () => {
     if (!current()) return;
-    await ready();
+    await within(ready(), deadline - Date.now());
+    session = sessionRevision;
     if (!current()) return;
-    const trackId = ids?.[start];
-    if (!trackId) return;
-    if (!authState?.is_active) {
-      await ctl(["activate"], 4000);
-      if (!current()) return;
-    }
-    await ctl(["play", `spotify:track:${trackId}`], 6000);
-    if (!current()) return;
-    const pos = Math.max(0, Math.round(position));
-    const extras = [];
-    if (pos > 0) extras.push(ctl(["seek", String(pos)], 4000));
-    if (playback?.options?.shuffle) extras.push(ctl(["shuffle", "off"], 4000).catch(() => {}));
-    if (playback?.options?.repeat && playback.options.repeat !== "off") extras.push(ctl(["repeat", "off"], 4000).catch(() => {}));
-    if (extras.length) await Promise.all(extras);
-    lastPlaybackError = "";
-  };
-  const result = queueJob.then(run).catch(e => {
-    lastPlaybackError = e?.detail ? `${e.message} (${e.detail})` : (e?.message || String(e));
+    await run(current, deadline);
+    current();
+  });
+  queueJob = job.catch(() => {});
+  return within(job, deadline - Date.now() + 500).catch(e => {
+    expired = true;
+    if (generation !== null && generation !== playGeneration) return;
+    if (report && epoch === startGeneration) playbackError(e.message);
     throw e;
   });
-  queueJob = result.catch(() => {});
-  return result;
 }
-export async function remotePause() { ++playGeneration; await ready(); await ctl(["pause"]); }
-export async function remoteResume() { await ready(); if (!authState?.is_active) await ctl(["activate"], 4000); await ctl(["play"], 4000); }
-export async function remoteSeek({ position }) { await ready(); await ctl(["seek", String(Math.max(0, Math.round(position)))]); }
-export async function remoteVolume({ percent }) { await ready(); await ctl(["volume", String(Math.max(0, Math.min(100, Math.round(percent))))]); }
-export async function remoteState() {
-  await ready(); if (!playback || !playback.is_active) return null;
-  return { playing: playback.status === "playing" || playback.status === "buffering", trackId: playback.item?.uri?.replace(/^spotify:track:/, "") || "", position: positionNow(), duration: playback.item?.decorations?.playback?.duration_ms || 0, volume: playback.volume || 0, device: authState?.device_name || "MyGo Soloist" };
+function budget(deadline, max) {
+  const ms = Math.min(max, deadline - Date.now());
+  if (ms <= 0) throw timeoutError();
+  return ms;
 }
-export async function remoteDevices() { const a = await ensureSoloist(); return [{ id: "soloist", name: a.device_name || "MyGo Soloist", active: !!a.is_active }]; }
-export async function remoteUse({ deviceId }) { if (deviceId !== "soloist") throw new Error("Unknown Soloist device"); await ready(); await ctl(["activate"]); }
+async function readSnapshot(current, deadline) {
+  const revision = eventRevision;
+  const raw = await ctl(["now", "--json"], budget(deadline, 1500));
+  let state;
+  try { state = JSON.parse(raw); } catch {}
+  if (state?.type !== "playback_state") throw new Error(t("Soloist did not provide its local connection state."));
+  if (current() && revision === eventRevision) onEvent(state);
+}
+async function waitForTrack(id, since, current, deadline, seekable) {
+  function matches() {
+    return playbackRevision > since && targetPlaying(id) && (!seekable ||
+      (playback.status === "playing" && (!playback.available_actions || playback.available_actions.seek != null)));
+  }
+  let probeAt = Date.now() + 400;
+  while (current() && Date.now() < deadline) {
+    if (matches()) return true;
+    if (Date.now() >= probeAt) {
+      try { await readSnapshot(current, deadline); } catch {}
+      probeAt = Date.now() + 600;
+    } else await delay(Math.min(100, deadline - Date.now()));
+  }
+  return current() && matches();
+}
+async function activate(current, deadline, force = false) {
+  if (!force && authState?.is_active) return;
+  try { await ctl(["activate"], budget(deadline, 4000)); }
+  catch (e) {
+    if (e.code) throw e;
+    await delay(200);
+    if (current() && !authState?.is_active) await ctl(["activate"], budget(deadline, 4000));
+  }
+}
+async function playTarget(id, position, current, deadline, resume = false) {
+  await activate(current, deadline);
+  if (!current()) return;
+  detachedTrackId = "";
+  const since = playbackRevision;
+  const timeout = budget(deadline, 6500);
+  if (!resume) manage(id);
+  const command = resume ? ["play"] : ["play", `spotify:track:${id}`];
+  let commandError;
+  try { await ctl(command, timeout); }
+  catch (e) {
+    commandError = e;
+    // Retry only an explicit unavailable-action rejection. An ambiguous transport
+    // failure may already be playing the track and must be reconciled by observation.
+    if (e.actionUnavailable && current()) {
+      await delay(200);
+      if (current() && !(playbackRevision > since && targetPlaying(id))) {
+        try {
+          if (e.inactive) await activate(current, deadline, true);
+          if (!current()) return;
+          await ctl(command, budget(deadline, 4000));
+          commandError = null;
+        } catch (retryError) { commandError = retryError; }
+      }
+    }
+  }
+  if (!current()) return;
+  const confirmed = await waitForTrack(id, since, current, Math.min(deadline, Date.now() + (commandError ? 3500 : 6500)), false);
+  if (!current()) return;
+  if (!confirmed) {
+    manage();
+    // The CLI cannot retract a request already received by the daemon. Reconcile a
+    // late target event while this is still the listener's most recent selection.
+    failedPlay = { id, revision: since, until: Date.now() + 30000 };
+    throw commandError || new Error(t("Soloist did not confirm playback of the selected track."));
+  }
+  if (!managed.id) { manage(id); managed.seen = true; }
+  let warning = "";
+  const pos = Math.max(0, Math.round(position));
+  if (pos > 0) {
+    const until = Math.min(deadline, Date.now() + 6000);
+    const seekable = await waitForTrack(id, since, current, until, true);
+    if (!current()) return;
+    let restored = false;
+    if (seekable) {
+      for (let attempt = 0; attempt < 2 && current() && targetPlaying(id); ++attempt) {
+        try { await ctl(["seek", String(pos)], budget(deadline, 2000)); restored = true; break; }
+        catch {
+          try { await readSnapshot(current, deadline); } catch {}
+          if (targetPlaying(id) && Math.abs(positionNow() - pos) < 1000) { restored = true; break; }
+          if (attempt === 0) await delay(150);
+        }
+      }
+    }
+    if (!restored) warning = t("Playback started, but the saved position could not be restored.");
+  }
+  for (const mode of ["shuffle", "repeat"]) {
+    if (!current() || !targetPlaying(id)) break;
+    const value = playback.options?.[mode];
+    if (value && value !== "off") {
+      try { await ctl([mode, "off"], budget(deadline, 1500)); }
+      catch { warning ||= t("Playback started, but the Soloist playback options could not be reset."); }
+    }
+  }
+  if (current()) playbackError(warning);
+}
+export async function remotePlay({ ids, start = 0, position = 0 }) {
+  ++playGeneration;
+  failedPlay = null;
+  return enqueue((current, deadline) => {
+    const id = ids?.[start];
+    if (!id) throw new Error(t("No track selected."));
+    return playTarget(id, position, current, deadline);
+  });
+}
+export async function remotePause() {
+  ++playGeneration;
+  if (managed.id && (!managed.seen || playback?.status === "buffering")) failedPlay = { id: managed.id, revision: playbackRevision, until: Date.now() + 30000 };
+  return enqueue((current, deadline) => ctl(["pause"], budget(deadline, 5000)));
+}
+export async function remoteResume() {
+  ++playGeneration;
+  failedPlay = null;
+  return enqueue(async (current, deadline) => {
+    if (!detachedTrackId && !managed.id && !playback?.item) await readSnapshot(current, deadline);
+    if (!current()) return;
+    const id = detachedTrackId || managed.id || trackIdOf(playback?.item);
+    if (!id) throw new Error(t("No track selected."));
+    const duration = playback?.item?.decorations?.playback?.duration_ms || 0;
+    const atEnd = managed.seen && playback?.status === "paused" && duration > 0 && positionNow() >= duration;
+    return playTarget(id, 0, current, deadline, !atEnd && !managed.replacement && !detachedTrackId);
+  });
+}
+export async function remoteSeek({ position }) {
+  return enqueue((current, deadline) => ctl(["seek", String(Math.max(0, Math.round(position)))], budget(deadline, 5000)));
+}
+export async function remoteVolume({ percent }) {
+  return enqueue((current, deadline) => ctl(["volume", String(Math.max(0, Math.min(100, Math.round(percent))))], budget(deadline, 5000)), true, null);
+}
+async function reportObservation(read) {
+  const epoch = startGeneration, generation = playGeneration;
+  try { return await read(); } catch (e) {
+    if (epoch === startGeneration && generation === playGeneration && !lastPlaybackError) playbackError(e.message);
+    throw e;
+  }
+}
+export async function remoteState() { return reportObservation(readRemoteState); }
+async function readRemoteState() {
+  await ready();
+  if (transitionPending || (managed.id && (!playback || !managed.seen))) {
+    const epoch = startGeneration, generation = playGeneration;
+    await readSnapshot(() => epoch === startGeneration && generation === playGeneration, Date.now() + 2000);
+  }
+  if (detachedTrackId && !playback?.is_active) throw new Error(t("Playback moved to another Spotify device."));
+  if (managed.replacement) {
+    await pauseReplacement(managed.id, managed.replacement);
+    if (managed.replacement) return null;
+  }
+  if (transitionPending || (managed.id && (!playback || !managed.seen))) throw new Error(t("Waiting for the selected track."));
+  if (!playback?.is_active) return null;
+  return { playing: playback.status === "playing" || playback.status === "buffering", trackId: trackIdOf(playback.item), position: positionNow(), duration: playback.item?.decorations?.playback?.duration_ms || 0, volume: playback.volume || 0, device: authState?.device_name || "MyGo Soloist" };
+}
+export async function remoteDevices() {
+  return reportObservation(async () => {
+    const a = await ensureSoloist();
+    return [{ id: "soloist", name: a.device_name || "MyGo Soloist", active: !!a.is_active }];
+  });
+}
+export async function remoteUse({ deviceId }) {
+  return enqueue((current, deadline) => {
+    if (deviceId !== "soloist") throw new Error(t("Unknown Soloist device."));
+    return activate(current, deadline);
+  }, true, null);
+}
 
 // Start Soloist in the background as soon as MyGo mounts this plugin runtime.
 if (typeof setTimeout === "function") setTimeout(warmupSoloist, 0);

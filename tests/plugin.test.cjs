@@ -1,31 +1,49 @@
 const test=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs');const vm=require('node:vm');const path=require('node:path');
 const source=fs.readFileSync(path.join(__dirname,'../index.js'),'utf8');
-function stateMachine(){let now=1000;const from=source.indexOf('function onEvent('),to=source.indexOf('async function watch(',from);assert(from>=0&&to>from);const c={Date:{now:()=>now},Math};vm.runInNewContext('let authState=null,playback=null,anchoredAt=0;'+source.slice(from,to)+';globalThis.subject={onEvent,positionNow,get:()=>playback,auth:()=>authState}',c);return {...c.subject,tick:ms=>now+=ms}}
-// Locally elapsed time must advance position without trusting the daemon's wall clock.
-test('playback progress interpolates locally and freezes on pause',()=>{const s=stateMachine();s.onEvent({type:'playback_state',status:'playing',item:{decorations:{playback:{duration_ms:60000}}},position:{position_ms:10000,timestamp_ms:999999999,speed:1}});s.tick(1500);assert.equal(s.positionNow(),11500);s.onEvent({type:'playback_changed',status:'paused'});s.tick(3000);assert.equal(s.positionNow(),11500);s.onEvent({type:'position_sync',position:{position_ms:30000,speed:0}});assert.equal(s.positionNow(),30000)});
-// Track changes must reset position and the duration cap; logout clears the old playback.
-test('track transition, volume, device and logout events replace state',()=>{const s=stateMachine();s.onEvent({type:'auth_state',logged_in:true,is_active:true});s.onEvent({type:'playback_state',status:'playing',item:{decorations:{playback:{duration_ms:50000}}},position:{position_ms:10000,speed:1},volume:40});s.onEvent({type:'track_changed',item:{decorations:{playback:{duration_ms:2000}}}});s.tick(3000);assert.equal(s.positionNow(),2000);s.onEvent({type:'volume_changed',volume:65});assert.equal(s.get().volume,65);s.onEvent({type:'device_changed',is_active:false,device_name:'MyGo Soloist'});assert.equal(s.get().is_active,false);assert.equal(s.auth().is_active,false);s.onEvent({type:'auth_state',logged_in:false});assert.equal(s.get(),null)});
-function queueMachine({active=true,playbackState={options:{shuffle:false,repeat:'off'}},ctlFail=null}={}){
-  const from=source.indexOf('let queueJob = Promise.resolve();'),to=source.indexOf('export async function remoteResume()',from);
-  assert(from>=0&&to>from);
-  const commands=[];
-  let unblock;
-  const gate=new Promise(r=>unblock=r);
-  let readyCalls=0;
-  const c={
-    Date,Math,Promise,Error,String,
-    authState:{device_name:'MyGo Soloist',is_active:active},
-    playback:playbackState,
-    lastPlaybackError:'',
-    t:s=>s,
-    ready:async()=>{if(++readyCalls===1)await gate},
-    ctl:async(args)=>{
-      if(ctlFail&&args[0]==='play')throw ctlFail;
-      commands.push(args);
+function controller({ active = true, beforeReady, command, saved, onDelay } = {}) {
+  let now = 1000;
+  const commands = [], store = saved || new Map();
+  const c = {
+    Date: { now: () => now }, setTimeout, clearTimeout, t: s => s,
+    delay: async ms => { now += ms; onDelay?.(api, ms); },
+    host: { storage: { get: k => store.get(k), set: (k,v) => store.set(k,v), remove: k => store.delete(k) } },
+    readyImpl: async () => beforeReady?.(),
+    ctlImpl: async args => {
+      commands.push(Array.from(args));
+      return command?.(args, api) ?? '';
     },
   };
-  vm.runInNewContext(source.slice(from,to).replaceAll('export async function','async function')+';globalThis.subject={remotePlay,remotePause,getError:()=>lastPlaybackError}',c);
-  return {...c.subject,commands,unblock};
+  const sourceFrom = source.indexOf('const EXE = "bin/soloist.exe";');
+  const code = source.slice(source.indexOf('function killProcess('),source.indexOf('async function helper(')) +
+    source.slice(sourceFrom, source.indexOf('// Start Soloist in the background')).replaceAll('export async function','async function');
+  vm.runInNewContext(code + `
+    ready = readyImpl; ctl = ctlImpl; ensureSoloist = async () => authState;
+    globalThis.api = { onEvent, positionNow, remotePlay, remoteResume, remotePause, remoteState, remoteSeek, remoteVolume, remoteUse, remoteDevices, browse, stopSoloist,
+      get: () => playback, auth: () => authState, getError: () => lastPlaybackError, setError: playbackError, settled: () => queueJob };
+  `, c);
+  const api = { ...c.api, commands, store, tick: ms => now += ms };
+  api.onEvent({type:'auth_state', logged_in:true, is_active:active});
+  return api;
+}
+function snapshot(id, changes = {}) {
+  return { type:'playback_state', status:'playing', is_active:true, item:{uri:`spotify:track:${id}`,decorations:{playback:{duration_ms:180000}}},
+    context:{uri:`spotify:track:${id}`}, available_actions:{seek:{}}, position:{position_ms:0,speed:1}, ...changes };
+}
+// Locally elapsed time must advance position without trusting the daemon's wall clock.
+test('playback progress interpolates locally and freezes on pause',()=>{const s=controller();s.onEvent({type:'playback_state',status:'playing',item:{decorations:{playback:{duration_ms:60000}}},position:{position_ms:10000,timestamp_ms:999999999,speed:1}});s.tick(1500);assert.equal(s.positionNow(),11500);s.onEvent({type:'playback_changed',status:'paused'});s.tick(3000);assert.equal(s.positionNow(),11500);s.onEvent({type:'position_sync',position:{position_ms:30000,speed:0}});assert.equal(s.positionNow(),30000)});
+// Track changes must reset position and the duration cap; logout clears the old playback.
+test('track transition, volume, device and logout events replace state',()=>{const s=controller();s.onEvent({type:'auth_state',logged_in:true,is_active:true});s.onEvent({type:'playback_state',status:'playing',item:{decorations:{playback:{duration_ms:50000}}},position:{position_ms:10000,speed:1},volume:40});s.onEvent({type:'track_changed',item:{decorations:{playback:{duration_ms:2000}}}});s.tick(3000);assert.equal(s.positionNow(),2000);s.onEvent({type:'volume_changed',volume:65});assert.equal(s.get().volume,65);s.onEvent({type:'device_changed',is_active:false,device_name:'MyGo Soloist'});assert.equal(s.get().is_active,false);assert.equal(s.auth().is_active,false);s.onEvent({type:'auth_state',logged_in:false});assert.equal(s.get(),null)});
+function queueMachine({active=true,playbackState={options:{shuffle:false,repeat:'off'}},ctlFail=null}={}){
+  let unblock, readyCalls = 0;
+  const gate = new Promise(r => unblock = r);
+  const api = controller({ active, beforeReady: async () => { if (++readyCalls === 1) await gate; },
+    command(args, api) {
+      if (args[0] === 'play') {
+        if (ctlFail) throw ctlFail;
+        api.onEvent(snapshot(args[1].slice(14), playbackState));
+      }
+    } });
+  return {...api, unblock};
 }
 // A later selection supersedes a request that is still waiting for the backend.
 test('latest selection supersedes queued playback',async()=>{
@@ -42,12 +60,12 @@ test('pause cancels pending playback',async()=>{
   const q=queueMachine();
   const first=q.remotePlay({ids:['old']});
   await Promise.resolve();await Promise.resolve();
-  await q.remotePause();
+  const paused=q.remotePause();
   q.unblock();
-  await first;
+  await Promise.all([first,paused]);
   assert.deepEqual(Array.from(q.commands,a=>Array.from(a)),[['pause']]);
 });
-test('remotePlay skips redundant activate/shuffle/repeat when active, activates and seeks when needed, and records error details',async()=>{
+test('remotePlay skips redundant activate/shuffle/repeat when active, activates and seeks when needed, and records command failures',async()=>{
   const q=queueMachine({active:false,playbackState:{options:{shuffle:true,repeat:'context'}}});
   q.unblock();
   await q.remotePlay({ids:['t0','t1'],start:1,position:12345});
@@ -60,10 +78,10 @@ test('remotePlay skips redundant activate/shuffle/repeat when active, activates 
   ]);
   assert.equal(q.getError(),'');
 
-  const failing=queueMachine({ctlFail:Object.assign(new Error('Playback failed.'),{detail:'ws disconnected'})});
+  const failing=queueMachine({ctlFail:new Error('Playback failed.')});
   failing.unblock();
   await assert.rejects(failing.remotePlay({ids:['t1']}),/Playback failed/);
-  assert.equal(failing.getError(),'Playback failed. (ws disconnected)');
+  assert.equal(failing.getError(),'Playback failed.');
 });
 
 function artistHarness(mockApi){
@@ -178,10 +196,11 @@ function warmupHarness({platform='windows',settings={},dataDir='D:/plugin-data/s
     delay:async()=>{},
     helper:helperImpl,
     processResult:processResultImpl,
+    killProcess:p=>p?.kill?.(),clearTimeout,
     spawnProcess:(prog,args)=>spawnImpl(prog,args),
     setTimeout:(fn,ms)=>{timers.push({fn,ms});return timers.length;},
   };
-  vm.runInNewContext(code+';globalThis.subject={ensureSoloist,warmupSoloist,resolveConfig,stopSoloist}',c);
+  vm.runInNewContext(code+';globalThis.subject={ensureSoloist,warmupSoloist,resolveConfig,stopSoloist,config,getAuth:()=>authState}',c);
   return {...c.subject,timers};
 }
 
@@ -203,7 +222,7 @@ test('mount warmup schedules Soloist startup asynchronously and shares startProm
       let sent=false;
       return {
         closeStdin(){},
-        readLine:async()=>{if(sent)return null;sent=true;return '{"type":"auth_state","logged_in":true,"device_name":"MyGo Soloist","is_active":false}';},
+        readLine:async()=>{if(sent)return new Promise(()=>{});sent=true;return '{"type":"auth_state","logged_in":true,"device_name":"MyGo Soloist","is_active":false}';},
         wait:async()=>0,
       };
     },
@@ -231,7 +250,7 @@ test('mount warmup swallows setup failures without poisoning later retries and s
       let sent=false;
       return {
         closeStdin(){},
-        readLine:async()=>{if(sent)return null;sent=true;return '{"type":"auth_state","logged_in":false,"device_name":"MyGo Soloist","is_active":false}';},
+        readLine:async()=>{if(sent)return new Promise(()=>{});sent=true;return '{"type":"auth_state","logged_in":false,"device_name":"MyGo Soloist","is_active":false}';},
         wait:async()=>0,
       };
     },
@@ -428,4 +447,407 @@ test('playlist CRUD, batch item edits, move index translation, and accurate libr
   assert.equal(moveCalls[0].body.insert_before,0);
   assert.equal(moveCalls[1].body.range_start,0);
   assert.equal(moveCalls[1].body.insert_before,4);
+});
+
+test('unpaired errors do not trigger a setup lock and passive events preserve playback diagnostics',async()=>{
+  const s=controller();
+  s.onEvent({type:'auth_state',logged_in:false,is_active:false});
+  s.setError('Not paired: select MyGo Soloist in Spotify.');
+  s.onEvent({type:'auth_state',logged_in:true,is_active:true});
+  assert.equal(s.getError(),'Not paired: select MyGo Soloist in Spotify.');
+
+  s.setError('Transient failure');
+  s.onEvent({type:'playback_state',status:'paused',item:{decorations:{playback:{duration_ms:10000}}},position:{position_ms:0,speed:0}});
+  assert.equal(s.getError(),'Transient failure');
+  s.onEvent({type:'playback_state',status:'playing',item:{decorations:{playback:{duration_ms:10000}}},position:{position_ms:1000,speed:1}});
+  assert.equal(s.getError(),'Transient failure');
+
+  const from=source.indexOf('const EXE = "bin/soloist.exe";'),to=source.indexOf('export async function browse(',from);
+  assert(from>=0&&to>from);
+  const c={
+    Date,Math,Promise,Error,JSON,Object,String,
+    host:{platform:'windows',setting:()=>'direct-key',spawn:()=>{
+      let sent=false;
+      return {
+        closeStdin(){},
+        readLine:async()=>{if(sent)return new Promise(()=>{});sent=true;return '{"type":"auth_state","logged_in":false,"device_name":"MyGo Soloist","is_active":false}';},
+        wait:async()=>0,
+      };
+    }},
+    t:s=>s,
+    problem:(code,msg)=>Object.assign(new Error(msg),{code}),
+    delay:async()=>{},
+    helper:async()=>{throw new Error('unused');},
+    processResult:async(prog,args)=>args[1]==='status'?{code:0,output:'running (pid 42)',error:''}:{code:3,output:'',error:'not logged in'},
+    spawnProcess:(prog,args)=>c.host.spawn(prog,args),
+  };
+  vm.runInNewContext(source.slice(from,to)+';globalThis.subject={ready,ctl}',c);
+  await assert.rejects(c.subject.ready(),e=>e.code===undefined&&/Not paired/.test(e.message));
+  await assert.rejects(c.subject.ctl(['play','spotify:track:1']),e=>e.code===undefined&&/Not paired/.test(e.message));
+});
+
+test('autoplay after managed track end reports track ended to MyGo, pauses autoplay, and preserves remote takeover detection',async()=>{
+  const s = controller({command(args, api) {
+    if (args[0] === 'play') {
+      api.onEvent(snapshot('oldTrack')); // A queued trace event may arrive before the requested URI.
+      api.onEvent(snapshot(args[1].slice(14)));
+    }
+  }});
+  const { commands } = s;
+  await s.remotePlay({ids:['trackA','trackB'],start:0});
+  assert.deepEqual(commands,[['play','spotify:track:trackA']]);
+  commands.length=0;
+
+  // Track A begins playing and nears its end (243s / 243s).
+  s.onEvent({type:'playback_state',status:'playing',is_active:true,item:{uri:'spotify:track:trackA',decorations:{playback:{duration_ms:243000}}},context:{uri:'spotify:track:trackA'},position:{position_ms:240000,speed:1},volume:40});
+  assert.equal((await s.remoteState()).trackId,'trackA');
+  s.tick(3000);
+
+  // Soloist jumps to an unrequested Spotify [autoplay] track when trackA finishes.
+  s.onEvent({type:'track_changed',item:{uri:'spotify:track:autoplayX',decorations:{playback:{duration_ms:300000}}}});
+  s.onEvent({type:'playback_state',status:'playing',is_active:true,item:{uri:'spotify:track:autoplayX',decorations:{playback:{duration_ms:300000}}},context:{uri:'spotify:track:trackA'},position:{position_ms:500,speed:1},volume:40});
+  await new Promise(r=>setImmediate(r));
+
+  // remoteState() must report null so MyGo calls remoteEnded() -> next track, and autoplay must be paused once.
+  assert.equal(await s.remoteState(),null);
+  assert.deepEqual(commands,[['pause']]);
+  commands.length=0;
+
+  // If this was the end of MyGo's queue and user hits Play again, remoteResume() must replay trackA, not autoplayX.
+  await s.remoteResume();
+  assert.deepEqual(commands,[['play','spotify:track:trackA']]);
+  commands.length=0;
+
+  // 2. When MyGo advances to trackB, normal playback resumes cleanly.
+  await s.remotePlay({ids:['trackA','trackB'],start:1});
+  assert.deepEqual(commands,[['play','spotify:track:trackB']]);
+  commands.length=0;
+  s.onEvent({type:'playback_state',status:'playing',is_active:true,item:{uri:'spotify:track:trackB',decorations:{playback:{duration_ms:180000}}},context:{uri:'spotify:track:trackB'},position:{position_ms:10000,speed:1},volume:40});
+  assert.equal((await s.remoteState()).trackId,'trackB');
+
+  // 3. If the listener genuinely switches to a different album mid-song on phone Spotify, report it normally.
+  s.onEvent({type:'playback_state',status:'playing',is_active:true,item:{uri:'spotify:track:phoneSong',decorations:{playback:{duration_ms:210000}}},context:{uri:'spotify:album:otherAlbum'},position:{position_ms:1000,speed:1},volume:40});
+  await new Promise(r=>setImmediate(r));
+  assert.equal((await s.remoteState()).trackId,'phoneSong');
+  assert.deepEqual(commands,[]);
+});
+
+test('cold replay of the saved track waits for fresh, active and seekable playback', async () => {
+  let stage = 0, sought;
+  const s = controller({ active:false, command(args, api) {
+    if (args[0] === 'activate') api.onEvent({type:'device_changed',is_active:true});
+    if (args[0] === 'play') api.onEvent(snapshot('saved',{status:'buffering',available_actions:{}}));
+    if (args[0] === 'seek') sought = [stage, Number(args[1])];
+  }, onDelay(api) {
+    if (++stage === 1) api.onEvent(snapshot('saved',{available_actions:{}}));
+    if (stage === 2) api.onEvent(snapshot('saved'));
+  }});
+  s.onEvent(snapshot('saved',{is_active:false}));
+  await s.remotePlay({ids:['saved'],position:1000});
+  assert.deepEqual(sought,[2,1000]);
+  assert.equal(s.getError(),'');
+  assert.equal((await s.remoteState()).playing,true);
+});
+
+test('accepted play survives seek failure, retains a diagnostic across VM reload, and clears it on the next successful play', async () => {
+  const s = controller({command(args, api) {
+    if (args[0] === 'play') api.onEvent(snapshot('saved'));
+    if (args[0] === 'seek') throw new Error('command failed');
+  }});
+  await s.remotePlay({ids:['saved'],position:12000});
+  assert.equal(s.commands.filter(c => c[0] === 'seek').length,2);
+  s.onEvent(snapshot('saved'));
+  s.onEvent({type:'auth_state',logged_in:true,is_active:true});
+  await s.remoteVolume({percent:50});
+  assert.match(s.getError(),/saved position/);
+  const reopened = controller({saved:s.store, command(args,api) { if(args[0]==='play') api.onEvent(snapshot('saved')); }});
+  const page = await reopened.browse({page:'soloist'});
+  assert.equal(page.sections[0].title,'Last Playback Error');
+  assert.equal(page.sections[0].empty,s.getError());
+  await reopened.remotePlay({ids:['saved']});
+  assert.equal(reopened.store.has('lastPlaybackError'),false);
+  assert.equal((await reopened.browse({page:'soloist'})).sections.length,1);
+});
+
+test('a seek acknowledged only by its resulting position is not replayed', async () => {
+  const s = controller({command(args,api) {
+    if (args[0]==='play') api.onEvent(snapshot('saved'));
+    if (args[0]==='seek') throw new Error('timeout');
+    if (args[0]==='now') return JSON.stringify(snapshot('saved',{position:{position_ms:42000,speed:1}}));
+  }});
+  await s.remotePlay({ids:['saved'],position:42000});
+  assert.deepEqual(s.commands.map(c=>c[0]),['play','seek','now']);
+  assert.equal(s.getError(),'');
+});
+
+test('activate retries transient failure, and an ambiguous play is reconciled without resending it', async () => {
+  let attempts = 0;
+  const s = controller({active:false,command(args,api) {
+    if(args[0]==='activate' && ++attempts===1) throw new Error('temporarily unavailable');
+    if(args[0]==='play') throw new Error('timeout');
+    if(args[0]==='now') return JSON.stringify(snapshot('cold'));
+  }});
+  await s.remotePlay({ids:['cold']});
+  assert.deepEqual(s.commands.map(c=>c[0]),['activate','activate','play','now']);
+  assert.equal(s.getError(),'');
+});
+
+test('unconfirmed play never adopts an old track, late playback is paused, and a later selection disarms cleanup',async()=>{
+  const s = controller({command(args,api) {
+    if(args[0]==='now') return JSON.stringify(snapshot('other'));
+    if(args[0]==='play' && args[1].endsWith(':next')) api.onEvent(snapshot('next'));
+  }});
+  s.onEvent(snapshot('late'));
+  await assert.rejects(s.remotePlay({ids:['late']}),/did not confirm/);
+  s.onEvent(snapshot('other'));
+  assert.equal(s.commands.some(c=>c[0]==='pause'),false);
+  s.onEvent(snapshot('late'));
+  await s.settled();
+  assert.equal(s.commands.filter(c=>c[0]==='pause').length,1);
+  assert.match(s.getError(),/did not confirm/);
+  await assert.rejects(s.remotePlay({ids:['late']}),/did not confirm/);
+  await s.remotePlay({ids:['next']});
+  s.onEvent(snapshot('late'));
+  await s.settled();
+  assert.equal(s.commands.filter(c=>c[0]==='pause').length,1);
+  assert.equal(s.getError(),'');
+});
+
+test('pause serializes behind dispatched play, supersedes its seek/error, and suppresses late startup audio',async()=>{
+  let started, finish;
+  const dispatched = new Promise(r=>started=r);
+  const gate = new Promise(r=>finish=r);
+  const s=controller({command:async args=>{if(args[0]==='play'){started();await gate;throw new Error('stale failure');}}});
+  const play=s.remotePlay({ids:['old'],position:12000});
+  await dispatched;
+  const pause=s.remotePause();
+  assert.deepEqual(s.commands.map(c=>c[0]),['play']);
+  finish();
+  await Promise.all([play,pause]);
+  assert.deepEqual(s.commands.map(c=>c[0]),['play','pause']);
+  s.onEvent(snapshot('old'));
+  await s.settled();
+  assert.deepEqual(s.commands.map(c=>c[0]),['play','pause','pause']);
+  assert.equal(s.getError(),'');
+});
+
+test('seek, volume and device controls serialize with resume and preserve actionable failures',async()=>{
+  let started,finish;
+  const dispatched=new Promise(r=>started=r), gate=new Promise(r=>finish=r);
+  const s=controller({command:async(args,api)=>{
+    if(args[0]==='play'){started();await gate;api.onEvent(snapshot('track'));}
+    if(args[0]==='volume')throw new Error('volume failed');
+  }});
+  s.onEvent(snapshot('track',{status:'paused'}));
+  const resume=s.remoteResume();await dispatched;
+  const seek=s.remoteSeek({position:82}), volume=s.remoteVolume({percent:20}), device=s.remoteUse({deviceId:'soloist'});
+  assert.deepEqual(s.commands,[['play']]);finish();
+  const results=await Promise.allSettled([resume,seek,volume,device]);
+  assert.deepEqual(results.map(r=>r.status),['fulfilled','fulfilled','rejected','fulfilled']);
+  assert.deepEqual(s.commands,[['play'],['seek','82'],['volume','20']]);
+  assert.equal(s.getError(),'volume failed');
+  assert.equal((await s.remoteDevices())[0].active,true);
+});
+
+test('near-end seek, same-track replay and a phone selection do not trigger an autoplay pause',async()=>{
+  const s=controller({command(args,api){
+    if(args[0]==='play') api.onEvent(snapshot('a'));
+    if(args[0]==='now') return JSON.stringify(snapshot('phone',{context:{uri:'spotify:album:other'}}));
+  }});
+  await s.remotePlay({ids:['a']});
+  s.onEvent({type:'position_sync',position:{position_ms:179800,speed:1}});
+  await s.remoteSeek({position:0});
+  s.onEvent(snapshot('a'));
+  await s.remotePlay({ids:['a']});
+  s.onEvent({type:'position_sync',position:{position_ms:179900,speed:1}});
+  s.onEvent({type:'track_changed',item:snapshot('phone').item});
+  assert.equal((await s.remoteState()).trackId,'phone');
+  assert.equal(s.commands.some(c=>c[0]==='pause'),false);
+});
+
+test('a device transfer stops tracking without advancing MyGo, and explicit resume retakes the selected URI',async()=>{
+  const s=controller({command(args,api){if(args[0]==='play')api.onEvent(snapshot('a'));}});
+  await s.remotePlay({ids:['a']});
+  s.onEvent({type:'device_changed',is_active:false});
+  s.onEvent(snapshot('phone',{is_active:false}));
+  await assert.rejects(s.remoteState(),/another Spotify device/);
+  s.commands.length=0;
+  await s.remoteResume();
+  assert.deepEqual(s.commands,[['activate'],['play','spotify:track:a']]);
+});
+
+test('autoplay pause failure is visible and retried before MyGo receives track end',async()=>{
+  let attempts=0;
+  const s=controller({command(args,api){
+    if(args[0]==='play')api.onEvent(snapshot('a'));
+    if(args[0]==='pause' && ++attempts===1)throw new Error('pause failed');
+  }});
+  await s.remotePlay({ids:['a']});
+  s.onEvent(snapshot('replacement',{context:{uri:'spotify:track:a'}}));
+  await new Promise(r=>setImmediate(r));
+  assert.equal(s.getError(),'pause failed');
+  assert.equal(await s.remoteState(),null);
+  assert.equal(attempts,2);
+});
+
+test('logout and configuration replacement invalidate controls that were awaiting a play result',async()=>{
+  for(const change of ['logout','configuration']){
+    let finish,started;
+    const gate=new Promise(r=>finish=r),dispatched=new Promise(r=>started=r);
+    const s=controller({command:async args=>{if(args[0]==='play'){started();await gate;}}});
+    const play=s.remotePlay({ids:['a'],position:12345});
+    await dispatched;
+    if(change==='logout') s.onEvent({type:'auth_state',logged_in:false,is_active:false});
+    else s.stopSoloist();
+    finish();
+    await assert.rejects(play,change==='logout'?/Not paired/:/configuration changed/);
+    assert.deepEqual(s.commands,[['play','spotify:track:a']]);
+  }
+});
+
+test('trace EOF reconnects without another user command and stale reconnect callbacks cannot revive stopped instances',async()=>{
+  let reads=0,end;
+  const h=warmupHarness({settings:{soloistApiKey:'test'},processResultImpl:async()=>({code:0,output:'running (pid 1)'}),spawnImpl:()=>{
+    reads++;
+    let sent=false;
+    return {closeStdin(){},kill(){},readLine:async()=>{
+      if(sent)return new Promise(r=>end=r);
+      sent=true;return JSON.stringify({type:'auth_state',logged_in:true,is_active:true,device_name:String(reads)});
+    }};
+  }});
+  assert.equal((await h.ensureSoloist()).device_name,'1');
+  end(null);await new Promise(r=>setImmediate(r));
+  const reconnect=h.timers.at(-1);
+  assert.equal(reconnect.ms,250);reconnect.fn();
+  await new Promise(r=>setImmediate(r));
+  assert.equal((await h.ensureSoloist()).device_name,'2');
+  end(null);await new Promise(r=>setImmediate(r));
+  const stale=h.timers.at(-1);
+  h.stopSoloist();stale.fn();assert.equal(reads,2);
+});
+
+test('failed daemon probe reaps only the owned daemon and permits a clean restart',async()=>{
+  let probes=0,killed=0;
+  const h=warmupHarness({settings:{soloistApiKey:'test'},processResultImpl:async()=>{
+    if(++probes===1)return {code:1,output:'stopped'};
+    if(probes===2)throw new Error('probe timed out');
+    return {code:0,output:'running (pid 2)'};
+  },spawnImpl:(prog,args)=>{
+    if(args[0]!=='ctl')return {closeStdin(){},kill(){killed++;},readLine:async()=>null,wait:()=>new Promise(()=>{})};
+    let sent=false;
+    return {closeStdin(){},readLine:async()=>{if(sent)return new Promise(()=>{});sent=true;return JSON.stringify({type:'auth_state',logged_in:true,is_active:false});}};
+  }});
+  await assert.rejects(h.ensureSoloist(),/probe timed out/);
+  assert.equal(killed,1);
+  assert.equal((await h.ensureSoloist()).logged_in,true);
+});
+
+test('processResult releases callers and kills a stuck ctl client even when the pipe never closes',async()=>{
+  let killed=0;
+  const c={setTimeout,clearTimeout,t:s=>s,spawnProcess:()=>({closeStdin(){},readLine:()=>new Promise(()=>{}),kill(){killed++;throw new Error('already stopped');}})};
+  const code=source.slice(source.indexOf('function killProcess('),source.indexOf('async function helper('));
+  vm.runInNewContext(code+';globalThis.call=processResult;',c);
+  await assert.rejects(c.call('helper',['ctl','play'],5),/timed out/);
+  assert.equal(killed,1);
+});
+
+test('a late track_changed delta after failure checks the actual device snapshot before pausing',async()=>{
+  let late=false;
+  const s=controller({command(args){if(args[0]==='now')return JSON.stringify(snapshot(late?'late':'other'));}});
+  await assert.rejects(s.remotePlay({ids:['late']}),/did not confirm/);
+  s.onEvent({type:'track_changed',item:snapshot('late').item});
+  await s.settled();
+  assert.equal(s.commands.some(c=>c[0]==='pause'),false);
+  late=true;
+  s.onEvent({type:'playback_changed',status:'playing'});
+  await s.settled();
+  assert.equal(s.commands.at(-1)[0],'pause');
+});
+
+test('resume at the exact end replays the managed URI while an ordinary pause resumes in place',async()=>{
+  const s=controller({command(args,api){if(args[0]==='play')api.onEvent(snapshot('a'));}});
+  await s.remotePlay({ids:['a']});
+  s.onEvent(snapshot('a',{status:'paused',position:{position_ms:179000,speed:0}}));
+  await s.remoteResume();
+  s.onEvent(snapshot('a',{status:'paused',position:{position_ms:180000,speed:0}}));
+  await s.remoteResume();
+  assert.deepEqual(s.commands,[['play','spotify:track:a'],['play'],['play','spotify:track:a']]);
+});
+
+test('old configuration rejection does not evict the replacement cached configuration',async()=>{
+  let rejectOld,calls=0;
+  const h=warmupHarness({helperImpl:async()=>{
+    if(++calls===1)return new Promise((_,reject)=>rejectOld=reject);
+    return {dataDir:'new'};
+  }});
+  const old=h.config();h.stopSoloist();
+  const effective=await h.config();
+  rejectOld(new Error('old configuration failed'));
+  await assert.rejects(old,/old configuration/);
+  assert.equal(await h.config(),effective);
+  assert.equal(calls,2);
+});
+
+test('daemon exit retires its trace and late events cannot restore a dead connection',async()=>{
+  let probes=0,exit,late,kills=0;
+  const h=warmupHarness({settings:{soloistApiKey:'test'},processResultImpl:async()=>++probes===1?{code:1,output:''}:{code:0,output:'running (pid 99)'},
+    spawnImpl:(prog,args)=>{
+      if(args[0]!=='ctl')return {closeStdin(){},readLine:async()=>null,wait:()=>new Promise(r=>exit=r)};
+      let sent=false;return {closeStdin(){},kill(){kills++;},readLine:async()=>{
+        if(sent)return new Promise(r=>late=r);
+        sent=true;return JSON.stringify({type:'auth_state',logged_in:true,is_active:true});
+      }};
+    }});
+  await h.ensureSoloist();exit(10);await new Promise(r=>setImmediate(r));
+  assert.equal(kills,1);assert.equal(h.getAuth(),null);
+  late(JSON.stringify({type:'auth_state',logged_in:true,is_active:true}));
+  await new Promise(r=>setImmediate(r));assert.equal(h.getAuth(),null);
+});
+
+test('startup that exhausts the command budget never dispatches play and reports the timeout',async()=>{
+  const s=controller({beforeReady:()=>s.tick(27000)});
+  await assert.rejects(s.remotePlay({ids:['late']}),/timed out/);
+  assert.deepEqual(s.commands,[]);
+  assert.match(s.getError(),/timed out/);
+});
+
+test('explicit inactive-device play rejection reactivates and retries only once',async()=>{
+  let attempts=0;
+  const s=controller({command(args,api){
+    if(args[0]==='play' && ++attempts===1)throw Object.assign(new Error('inactive'),{inactive:true,actionUnavailable:true});
+    if(args[0]==='play')api.onEvent(snapshot('saved'));
+  }});
+  await s.remotePlay({ids:['saved']});
+  assert.deepEqual(s.commands.map(c=>c[0]),['play','activate','play']);
+});
+
+test('a paused replacement that starts later is intercepted once',async()=>{
+  const s=controller({command(args,api){if(args[0]==='play')api.onEvent(snapshot('a'));}});
+  await s.remotePlay({ids:['a']});
+  const replacement={context:{uri:'spotify:track:a'}};
+  s.onEvent(snapshot('next',{...replacement,status:'paused'}));
+  assert.equal(await s.remoteState(),null);
+  assert.equal(s.commands.length,1);
+  s.onEvent({type:'playback_changed',status:'playing'});s.onEvent(snapshot('next',replacement));
+  await s.settled();
+  assert.deepEqual(s.commands,[['play','spotify:track:a'],['pause']]);
+});
+
+test('optional shuffle/repeat and diagnostic storage failures cannot detach accepted playback',async()=>{
+  const store=new Map();store.set=()=>{throw new Error('disk unavailable');};
+  const s=controller({saved:store,command(args,api){
+    if(args[0]==='play')api.onEvent(snapshot('a',{options:{shuffle:true,repeat:'track'}}));
+    if(args[0]==='shuffle')throw new Error('unavailable');
+  }});
+  await s.remotePlay({ids:['a']});
+  assert.match(s.getError(),/playback options/);
+  assert.equal((await s.remoteState()).trackId,'a');
+  assert.deepEqual(s.commands.map(c=>c[0]),['play','shuffle','repeat']);
+});
+
+test('ctl errors expose the verb, reason and exit code while discarding raw diagnostics',async()=>{
+  const c={startGeneration:1,authState:{logged_in:true},EXE:'helper',config:async()=>({}),dataArgs:()=>[],t:s=>s,
+    processResult:async()=>({code:3,error:'inactive device [private diagnostic]',output:''})};
+  vm.runInNewContext(source.slice(source.indexOf('async function ctl('),source.indexOf('async function ensureSoloist('))+';globalThis.call=ctl;',c);
+  await assert.rejects(c.call(['play','spotify:track:test']),e=>e.actionUnavailable && e.inactive && e.message==='Soloist is not the active device. (play, 3)');
 });

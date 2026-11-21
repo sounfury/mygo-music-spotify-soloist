@@ -7,17 +7,21 @@ A Windows x64 plugin for [MyGo Music](https://github.com/egoist/mygo-music) that
 > **💡 Background & Target Audience**  
 > This plugin is specifically designed for users who **cannot use librespot** due to [librespot-org/librespot#1649](https://github.com/librespot-org/librespot/issues/1649) and ongoing breaking protocol changes by Spotify. Instead of relying on reverse-engineered protocols that frequently break, Soloist is an official standalone playback engine provided directly by Spotify—offering a stable, compliant, and bit-perfect streaming experience.
 
-**Preview: Windows x64 only. A Spotify Premium account is required for setup and this plugin's Web API playback control.**
+**Note: Spotify Soloist currently ships Windows x64 preview builds (each valid for 90 days from its build date). A Spotify Premium account is required for Soloist playback.**
 
-## Features
+## Key Advantages & Features
 
-- **Official Native Audio Quality**: Audio is fetched, decoded, and output directly by Spotify Soloist with zero transcoding or third-party stream substitution.
-- **Full Library & Playlist Management**: Browse personalized home recommendations, global search (tracks, albums, artists, playlists), your playlists, liked songs, and saved albums; create, rename, delete, and save playlists, add/remove tracks in batches, and reorder playlist tracks.
-- **Rich Details & Bilingual Lyrics**: Dedicated album and artist pages (including artist follow/unfollow), with concurrent synchronized lyrics lookup across **LRCLIB, NetEase Cloud Music, and QQ Music**—prioritizing original + Chinese translation with in-memory caching.
-- **Seamless Playback Controls**: Play, pause, resume, seek, adjust volume, and integrate smoothly with MyGo's playback queue.
-- **Silent Background Warmup on Mount**: Automatically warms up Soloist silently in the background as soon as the plugin mounts (without stealing active playback from other devices) and restores saved Spotify Connect pairings, minimizing first-track cold-start latency.
-- **Event-Driven Local State**: Synchronizes playback state in real time using local events, eliminating the need to poll Spotify's cloud API every second.
-- **Dedicated Diagnostics Panel**: Built-in "Playback Status" page with clear connection diagnostics and status feedback.
+- **⚡ Instant Local Playback (Sub-Second Start)**: Starts tracks directly over Soloist's local WebSocket control channel—completely bypassing Spotify cloud device polling and cloud play API latency. Rapid track switching uses **generation preemption** so your latest click immediately supersedes stale requests.
+- **🎵 Official Native Audio, Zero librespot Breakage**: Audio is retrieved, decoded, and output directly by Spotify's official Soloist engine with zero transcoding or third-party stream substitution.
+- **🚀 Silent Warmup on Mount & Zero-Script Setup**: Automatically starts Soloist silently in the background as soon as the plugin mounts (no console window, never steals playback focus from other devices) and restores saved pairings for near-instant first playback. Paste your Soloist API key directly in MyGo's plugin settings with live reload; OAuth PKCE runs in pure JavaScript inside the sandbox with zero PowerShell overhead in normal use.
+- **🛡️ Resilient State Machine & Seamless Queue Control**:
+  - All write controls (play, pause, resume, seek, volume, device activation) share a single serialized queue with generation and connection checks;
+  - Session restore after restarting MyGo decouples playback start from seeking, avoiding false playback failures while a track is still buffering;
+  - Intercepts Spotify's automatic `[autoplay]` continuation at track end and hands queue progression back to MyGo (preserving MyGo shuffle, repeat one/all, mixed-source queues, and genuine phone takeover);
+  - Local `trace` event streaming reconnects automatically with backoff, and timed-out commands are reconciled against live state to prevent desync or ghost playback.
+- **📚 Full Library & Playlist Management**: Browse personalized home recommendations, global search (tracks, albums, artists, playlists), your playlists, liked songs, and saved albums; create, rename, delete, and save playlists, add/remove tracks in batches, and reorder playlist tracks.
+- **🌐 Rich Details & Tri-Source Bilingual Lyrics**: Dedicated album and artist pages (including artist follow/unfollow), with concurrent synchronized lyrics lookup across **LRCLIB, NetEase Cloud Music, and QQ Music**—prioritizing original + Chinese translation with in-memory caching.
+- **🔍 Persistent Diagnostics Panel**: Built-in "Playback Status" sidebar page displays pairing health and persists the latest playback diagnostic (action, reason, and exit code) until the next successful play/resume.
 
 ## Installation & Setup
 
@@ -126,7 +130,7 @@ On a default Windows installation, the destination path is:
 
 See [AGENTS.md](AGENTS.md) for project background, runtime constraints, and architecture details.
 
-`index.js` executes within MyGo's plugin runtime environment (not standard Node.js). `scripts/soloist-host.ps1` handles Windows DPAPI key storage and PKCE entropy generation. Regression tests cover the local playback state machine, queue generation preemption, artist page pagination/fallback, tri-source bilingual lyrics matching & decoding, and mount-time background warmup using mocked host interfaces without real Spotify credentials:
+`index.js` executes within MyGo's plugin sandbox runtime (not standard Node.js), with OAuth PKCE and all playback state management implemented in pure JavaScript; `scripts/soloist-host.ps1` remains available as an optional Windows DPAPI key storage helper. 39 built-in regression tests cover cold-start position restore, command timeout reconciliation, serialized playback controls, autoplay interception vs. phone takeover, `trace` auto-reconnect, artist page pagination/fallback, playlist editing/reordering, tri-source bilingual lyrics matching & decoding, and mount-time background warmup using mocked host interfaces without real Spotify credentials:
 
 ```bash
 node --check index.js
