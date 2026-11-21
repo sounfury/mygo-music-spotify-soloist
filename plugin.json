@@ -9,7 +9,10 @@
     "network": [
       "api.spotify.com",
       "accounts.spotify.com",
-      "lrclib.net"
+      "lrclib.net",
+      "music.163.com",
+      "c.y.qq.com",
+      "u.y.qq.com"
     ],
     "process": [
       "bin/soloist.exe",

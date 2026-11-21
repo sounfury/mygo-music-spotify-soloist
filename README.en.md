@@ -13,9 +13,9 @@ A Windows x64 plugin for [MyGo Music](https://github.com/egoist/mygo-music) that
 
 - **Official Native Audio Quality**: Audio is fetched, decoded, and output directly by Spotify Soloist with zero transcoding or third-party stream substitution.
 - **Full Library Browsing**: Browse personalized home recommendations, global search (tracks, albums, artists, playlists), your playlists, liked songs, and saved albums.
-- **Rich Details & Lyrics**: Dedicated album and artist pages, with synchronized scrolling lyrics automatically fetched from LRCLIB.
+- **Rich Details & Bilingual Lyrics**: Dedicated album and artist pages (including artist follow/unfollow), with concurrent synchronized lyrics lookup across **LRCLIB, NetEase Cloud Music, and QQ Music**—prioritizing original + Chinese translation with in-memory caching.
 - **Seamless Playback Controls**: Play, pause, resume, seek, adjust volume, and integrate smoothly with MyGo's playback queue.
-- **Silent Background Execution**: Runs Soloist in the background without terminal windows, and automatically restores saved Spotify Connect pairings.
+- **Silent Background Warmup on Mount**: Automatically warms up Soloist silently in the background as soon as the plugin mounts (without stealing active playback from other devices) and restores saved Spotify Connect pairings, minimizing first-track cold-start latency.
 - **Event-Driven Local State**: Synchronizes playback state in real time using local events, eliminating the need to poll Spotify's cloud API every second.
 - **Dedicated Diagnostics Panel**: Built-in "Playback Status" page with clear connection diagnostics and status feedback.
 
@@ -87,7 +87,7 @@ On a default Windows installation, the destination path is:
 
 ### 4. Pair once, then play in MyGo
 
-1. Switch the music source in MyGo Music to **Spotify Soloist**. Click any song or open the **Playback Status** page to let the plugin launch the background player.
+1. Switch the music source in MyGo Music to **Spotify Soloist**. The plugin automatically warms up the background Soloist engine on mount (you can also click any song or open the **Playback Status** page to inspect connection status).
 2. **Initial Pairing**: Ensure your computer and smartphone are connected to the same local area network (LAN/Wi-Fi). Open the official Spotify app on your phone, open the device picker, and select **MyGo Soloist**. Soloist saves the session and will automatically reconnect on subsequent runs. You can then use MyGo for playback without keeping the official desktop client running.
 3. **Process Lifecycle**: When started by this plugin, Soloist runs silently without console windows. Quitting MyGo or disabling the plugin automatically terminates these child processes. If you already started Soloist manually with its local API enabled, the plugin can attach to it without terminating your manual process.
 
@@ -102,7 +102,7 @@ On a default Windows installation, the destination path is:
 
 - **Process Isolation**: Only one Soloist process may access the data directory at a time. Existing pairings in the default location are preserved and reused. Signing out of the Web API account does not erase the separate Soloist device pairing.
 - **Security Notice**: While the stored key is encrypted via Windows DPAPI, Soloist currently requires the key to be passed via process command-line arguments, meaning local process monitoring tools may observe it. Avoid sharing raw command-line invocations, unredacted logs, or session folders. Spotify Web API tokens are securely stored in MyGo's local plugin storage. No user credentials or API keys are bundled with this repository.
-- **System Invocation**: The plugin requests permission to execute `bin/soloist.exe` and `powershell.exe` (used for local DPAPI access and cryptographically secure PKCE generation). Soloist binds its local control interface strictly to `127.0.0.1` using an automatically assigned port. Only basic track metadata (title and artist) is shared with LRCLIB when querying synchronized lyrics.
+- **System Invocation & Network**: The plugin requests permission to execute `bin/soloist.exe` and `powershell.exe` (used for local DPAPI access and cryptographically secure PKCE generation). Soloist binds its local control interface strictly to `127.0.0.1` using an automatically assigned port. When fetching bilingual synchronized lyrics, only public track metadata (title, artist, album, and duration) is sent to LRCLIB (`lrclib.net`), NetEase Cloud Music (`music.163.com`), and QQ Music (`c.y.qq.com`, `u.y.qq.com`).
 
 ## Limitations & Updates
 
@@ -124,9 +124,12 @@ On a default Windows installation, the destination path is:
 
 ## Development & Testing
 
-`index.js` executes within MyGo's plugin runtime environment (not standard Node.js). `scripts/soloist-host.ps1` handles Windows DPAPI key storage and PKCE entropy generation. Regression tests run against mocked host interfaces and do not require real Spotify credentials:
+See [AGENTS.md](AGENTS.md) for project background, runtime constraints, and architecture details.
+
+`index.js` executes within MyGo's plugin runtime environment (not standard Node.js). `scripts/soloist-host.ps1` handles Windows DPAPI key storage and PKCE entropy generation. Regression tests cover the local playback state machine, queue generation preemption, artist page pagination/fallback, tri-source bilingual lyrics matching & decoding, and mount-time background warmup using mocked host interfaces without real Spotify credentials:
 
 ```bash
+node --check index.js
 node --test tests/plugin.test.cjs
 ```
 

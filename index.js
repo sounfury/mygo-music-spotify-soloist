@@ -1,8 +1,9 @@
 // Independent MyGo Music integration: Spotify Web API catalog + official Soloist playback.
+// --- Auth & Spotify Web API ---
 const API = "https://api.spotify.com/v1";
 const AUTH = "https://accounts.spotify.com";
 const REDIRECT = "http://127.0.0.1:43110/callback";
-const SCOPES = "user-read-private user-read-email user-read-playback-state user-modify-playback-state user-read-recently-played user-top-read user-library-read user-library-modify playlist-read-private playlist-read-collaborative playlist-modify-private playlist-modify-public";
+const SCOPES = "user-read-private user-read-email user-read-playback-state user-modify-playback-state user-read-recently-played user-top-read user-library-read user-library-modify user-follow-read user-follow-modify playlist-read-private playlist-read-collaborative playlist-modify-private playlist-modify-public";
 const t = text => host.t(text);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 function problem(code, message) { return Object.assign(new Error(t(message)), { code }); }
@@ -97,6 +98,7 @@ export async function signIn() {
   const answer = await back;
   if (answer.state !== pkce.state || !answer.code) throw new Error(t("Spotify sign-in was cancelled or could not be verified."));
   saveTokens(await tokens({ grant_type: "authorization_code", code: answer.code, redirect_uri: REDIRECT, code_verifier: pkce.verifier }));
+  warmupSoloist();
   return account();
 }
 export function signOut() { host.storage.remove("session"); host.storage.remove("me"); }
@@ -106,6 +108,7 @@ export async function account() {
   const me = await api("GET", "/me"); host.storage.set("me", me.id);
   return { id: me.id, name: me.display_name || me.id, imageUrl: image(me.images), page: "soloist" };
 }
+// --- Catalog Mapping & Library Endpoints ---
 const image = items => items?.[0]?.url;
 const artistMap = a => a && ({ id: a.id, name: a.name, imageUrl: image(a.images) });
 const albumMap = a => a && ({ id: a.id, name: a.name, imageUrl: image(a.images), artists: (a.artists || []).map(artistMap), released: a.release_date });
@@ -156,10 +159,39 @@ export async function album({ id }) {
   return { album: albumMap(a), tracks: [...a.tracks.items.map(v => track(v, a)).filter(Boolean), ...rest] };
 }
 export async function artist({ id }) {
-  const a = await api("GET", `/artists/${encodeURIComponent(id)}`);
-  const [records, found] = await Promise.all([all(`/artists/${encodeURIComponent(id)}/albums`, { limit: 20, include_groups: "album,single" }, albumMap, 5), api("GET", "/search", undefined, { q: `artist:"${a.name}"`, type: "track", limit: 10 })]);
-  return { artist: artistMap(a), albums: records, tracks: found.tracks.items.filter(v => v.artists?.some(x => x.id === id)).map(v => track(v)).filter(Boolean) };
+  const encodedId = encodeURIComponent(id);
+  const fetchAlbums = async () => {
+    try {
+      return await all(`/artists/${encodedId}/albums`, { limit: 10, include_groups: "album,single" }, albumMap, 10);
+    } catch (e) {
+      if (e.status !== 400) throw e;
+      return all(`/artists/${encodedId}/albums`, { limit: 10 }, albumMap, 10);
+    }
+  };
+  const checkFollowing = async () => {
+    try {
+      const saved = await api("GET", "/me/library/contains", undefined, { uris: `spotify:artist:${id}` });
+      return !!saved?.[0];
+    } catch { return false; }
+  };
+  const [a, records, following] = await Promise.all([api("GET", `/artists/${encodedId}`), fetchAlbums(), checkFollowing()]);
+  const safeName = String(a.name || "").replace(/"/g, "").trim();
+  const tracks = new Map();
+  if (safeName) {
+    for (const offset of [0, 10]) {
+      const found = await api("GET", "/search", undefined, { q: `artist:"${safeName}"`, type: "track", limit: 10, offset });
+      for (const item of found?.tracks?.items || []) {
+        if (item?.id && item.artists?.some(x => x.id === id)) {
+          const mapped = track(item);
+          if (mapped) tracks.set(mapped.id, mapped);
+        }
+      }
+      if (!found?.tracks?.next) break;
+    }
+  }
+  return { artist: { ...artistMap(a), following }, albums: records, tracks: [...tracks.values()] };
 }
+export async function followArtist({ id, on }) { await api(on ? "PUT" : "DELETE", "/me/library", undefined, { uris: `spotify:artist:${id}` }); }
 export async function liked({ offset = 0 }) {
   const page = await api("GET", "/me/tracks", undefined, { offset, limit: 50 });
   return { tracks: page.items.map(v => track(v.track)).filter(Boolean), more: !!page.next };
@@ -179,11 +211,212 @@ export async function savedAlbums({ offset = 0 }) {
   return { albums: page.items.map(v => ({ ...albumMap(v.album), saved: true })), more: !!page.next };
 }
 export async function saveAlbum({ id, on }) { await api(on ? "PUT" : "DELETE", "/me/library", undefined, { uris: `spotify:album:${id}` }); }
+// --- Synchronized Bilingual Lyrics (LRCLIB + NetEase + QQ Music) ---
+const LYRIC_TIMEOUT = 6000;
+const LYRIC_DURATION_SLACK = 3000;
+const LYRIC_CACHE_MAX = 100;
+const LYRIC_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const HTML_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+const VARIANT_TAG = /\b(live|remix|cover|dj|instrumental|karaoke)\b|伴奏|纯音乐|翻唱/i;
+const lyricsCache = new Map();
+
+function hasTimestamps(lrc) { return /\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]/.test(String(lrc || "")); }
+function cleanTrackTitle(name) {
+  const raw = String(name || "").trim();
+  const stripped = raw.replace(/\s+-\s+.*$/, "").replace(/\s*[([（【].*?[)\]）】]\s*/g, " ").replace(/\s+/g, " ").trim();
+  return stripped || raw;
+}
+function normalizeMatchText(text) {
+  return String(text || "").toLowerCase().replace(/[\s\-_.,!?'":;()[\]{}（）【】《》「」『』、。，！？·/\\]+/g, "");
+}
+function decodeBase64Utf8(input) {
+  if (!input || typeof input !== "string") return "";
+  const cleaned = input.replace(/[^A-Za-z0-9+/=]/g, "");
+  const bytes = [];
+  for (let i = 0; i < cleaned.length; i += 4) {
+    const c1 = B64_ALPHABET.indexOf(cleaned[i]);
+    const c2 = B64_ALPHABET.indexOf(cleaned[i + 1]);
+    if (c1 < 0 || c2 < 0) break;
+    const c3 = cleaned[i + 2] === "=" ? -1 : B64_ALPHABET.indexOf(cleaned[i + 2]);
+    const c4 = cleaned[i + 3] === "=" ? -1 : B64_ALPHABET.indexOf(cleaned[i + 3]);
+    bytes.push((c1 << 2) | (c2 >> 4));
+    if (c3 >= 0) bytes.push(((c2 & 15) << 4) | (c3 >> 2));
+    if (c4 >= 0) bytes.push(((c3 & 3) << 6) | c4);
+  }
+  let out = "";
+  for (let i = 0; i < bytes.length;) {
+    const b0 = bytes[i++];
+    if (b0 < 0x80) out += String.fromCharCode(b0);
+    else if ((b0 & 0xe0) === 0xc0 && i < bytes.length) out += String.fromCharCode(((b0 & 0x1f) << 6) | (bytes[i++] & 0x3f));
+    else if ((b0 & 0xf0) === 0xe0 && i + 1 < bytes.length) {
+      const b1 = bytes[i++], b2 = bytes[i++];
+      out += String.fromCharCode(((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f));
+    } else if ((b0 & 0xf8) === 0xf0 && i + 2 < bytes.length) {
+      const b1 = bytes[i++], b2 = bytes[i++], b3 = bytes[i++];
+      const cp = (((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f)) - 0x10000;
+      if (cp >= 0) out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+    }
+  }
+  return out;
+}
+function decodeHtmlEntities(text) {
+  return String(text || "").replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, body) => {
+    if (body[0] === "#") {
+      const cp = body[1] === "x" || body[1] === "X" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+      return Number.isFinite(cp) && cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : match;
+    }
+    return HTML_ENTITIES[body.toLowerCase()] ?? match;
+  });
+}
+function cleanQqTranslation(raw) {
+  return decodeHtmlEntities(raw)
+    .split(/\r?\n/)
+    .filter(line => !/^\[kana:[^\]]*\]\s*$/i.test(line))
+    .filter(line => !/^(?:\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\])+\s*\/\/\s*$/.test(line.trim()))
+    .join("\n")
+    .trim();
+}
+function pickBestSong(candidates, meta) {
+  const wantedTitle = normalizeMatchText(cleanTrackTitle(meta.name));
+  const wantedArtists = (meta.artists || []).map(normalizeMatchText).filter(Boolean);
+  const targetIsVariant = VARIANT_TAG.test(meta.name || "");
+  let best = null, bestScore = -Infinity;
+  for (const item of candidates || []) {
+    if (!item?.id) continue;
+    const diff = meta.durationMs > 0 && item.durationMs > 0 ? Math.abs(item.durationMs - meta.durationMs) : 0;
+    if (meta.durationMs > 0 && item.durationMs > 0 && diff > LYRIC_DURATION_SLACK) continue;
+    let score = 1000 - diff / 10;
+    const candTitle = normalizeMatchText(cleanTrackTitle(item.name));
+    if (wantedTitle && candTitle) {
+      if (candTitle === wantedTitle) score += 150;
+      else if (candTitle.includes(wantedTitle) || wantedTitle.includes(candTitle)) score += 75;
+    }
+    const candArtists = (item.artists || []).map(normalizeMatchText).filter(Boolean);
+    if (wantedArtists.some(wa => candArtists.some(ca => ca === wa || ca.includes(wa) || wa.includes(ca)))) score += 200;
+    if (!targetIsVariant && VARIANT_TAG.test(item.name || "")) score -= 250;
+    if (score > bestScore) { bestScore = score; best = item; }
+  }
+  return best;
+}
+function pickBestLyrics({ lrclib, netease, qq }) {
+  for (const candidate of [netease, qq]) {
+    if (candidate?.lrc && candidate?.translation) return candidate;
+  }
+  for (const candidate of [lrclib, netease, qq]) {
+    if (candidate?.lrc) return candidate;
+  }
+  return null;
+}
+async function fetchJson(url, options, deadline = Date.now() + LYRIC_TIMEOUT) {
+  const { response: r, text } = await timedFetch(url, options, deadline);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return text ? JSON.parse(text) : null;
+}
+async function fetchLrclibLyrics(meta) {
+  const deadline = Date.now() + LYRIC_TIMEOUT;
+  const headers = { "User-Agent": "mygo-music-spotify-soloist" };
+  let entry = await fetchJson(`https://lrclib.net/api/get?${new URLSearchParams({
+    track_name: meta.name,
+    artist_name: meta.artists[0] || "",
+    album_name: meta.album,
+    duration: String(Math.round(meta.durationMs / 1000)),
+  })}`, { headers }, deadline);
+  if (!entry || !hasTimestamps(entry.syncedLyrics)) {
+    const found = await fetchJson(`https://lrclib.net/api/search?${new URLSearchParams({
+      track_name: cleanTrackTitle(meta.name),
+      artist_name: meta.artists[0] || "",
+    })}`, { headers }, deadline);
+    const list = (Array.isArray(found) ? found : []).map(item => ({
+      id: item?.id,
+      name: item?.trackName || "",
+      artists: item?.artistName ? [item.artistName] : [],
+      durationMs: Number(item?.duration || 0) * 1000,
+      raw: item,
+    })).filter(item => hasTimestamps(item.raw?.syncedLyrics));
+    entry = pickBestSong(list, meta)?.raw || entry;
+  }
+  const lrc = hasTimestamps(entry?.syncedLyrics) ? entry.syncedLyrics : "";
+  return lrc ? { lrc, translation: "" } : null;
+}
+async function fetchNeteaseLyrics(meta) {
+  const deadline = Date.now() + LYRIC_TIMEOUT;
+  const headers = { Referer: "https://music.163.com/", "User-Agent": LYRIC_UA };
+  const query = `${cleanTrackTitle(meta.name)} ${meta.artists[0] || ""}`.trim();
+  const search = await fetchJson(`https://music.163.com/api/cloudsearch/pc?${new URLSearchParams({ s: query, type: "1", limit: "10" })}`, { headers }, deadline);
+  const candidates = (search?.result?.songs || []).map(item => ({
+    id: item?.id,
+    name: item?.name || "",
+    artists: (item?.ar || []).map(a => a?.name).filter(Boolean),
+    durationMs: Number(item?.dt || 0),
+  }));
+  const matched = pickBestSong(candidates, meta);
+  if (!matched) return null;
+  const data = await fetchJson(`https://music.163.com/api/song/lyric?${new URLSearchParams({ id: String(matched.id), lv: "1", tv: "-1" })}`, { headers }, deadline);
+  if (!data || Number(data.code) !== 200) return null;
+  const lrc = hasTimestamps(data.lrc?.lyric) ? data.lrc.lyric : "";
+  const translation = hasTimestamps(data.tlyric?.lyric) ? data.tlyric.lyric : "";
+  return lrc ? { lrc, translation } : null;
+}
+async function fetchQqLyrics(meta) {
+  const deadline = Date.now() + LYRIC_TIMEOUT;
+  const headers = { Referer: "https://y.qq.com/", "User-Agent": LYRIC_UA };
+  const query = `${cleanTrackTitle(meta.name)} ${meta.artists[0] || ""}`.trim();
+  const search = await fetchJson(`https://c.y.qq.com/soso/fcgi-bin/client_search_cp?${new URLSearchParams({ w: query, p: "1", n: "10", format: "json", cr: "1", new_json: "1" })}`, { headers }, deadline);
+  const candidates = (search?.data?.song?.list || []).map(item => ({
+    id: item?.mid,
+    songId: item?.id,
+    name: item?.name || item?.title || "",
+    artists: (item?.singer || []).map(s => s?.name).filter(Boolean),
+    durationMs: Number(item?.interval || 0) * 1000,
+  }));
+  const matched = pickBestSong(candidates, meta);
+  if (!matched) return null;
+  const data = await fetchJson("https://u.y.qq.com/cgi-bin/musicu.fcg", {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({
+      comm: { ct: 19, cv: 1859, uin: "0" },
+      req: {
+        module: "music.musichallSong.PlayLyricInfo",
+        method: "GetPlayLyricInfo",
+        param: { songID: matched.songId || 0, songMID: matched.id, trans: 1, roma: 0, lrc_t: 0, crypt: 0 },
+      },
+    }),
+  }, deadline);
+  const info = data?.req?.data;
+  if (!info) return null;
+  const rawLrc = decodeHtmlEntities(decodeBase64Utf8(info.lyric || "")).trim();
+  const rawTrans = cleanQqTranslation(decodeBase64Utf8(info.trans || ""));
+  const lrc = hasTimestamps(rawLrc) ? rawLrc : "";
+  const translation = hasTimestamps(rawTrans) ? rawTrans : "";
+  return lrc ? { lrc, translation } : null;
+}
 export async function lyrics({ id }) {
-  const v = await api("GET", `/tracks/${encodeURIComponent(id)}`);
-  const params = new URLSearchParams({ track_name: v.name, artist_name: v.artists[0]?.name || "", album_name: v.album?.name || "", duration: String(Math.round(v.duration_ms / 1000)) });
-  const { response: r, text } = await timedFetch(`https://lrclib.net/api/get?${params}`); if (!r.ok) return {};
-  const data = JSON.parse(text); return data.syncedLyrics ? { lrc: data.syncedLyrics } : {};
+  const key = String(id || "");
+  if (!key) return { lrc: "", translation: "" };
+  if (lyricsCache.has(key)) return lyricsCache.get(key);
+  const v = await api("GET", `/tracks/${encodeURIComponent(key)}`);
+  if (!v) return { lrc: "", translation: "" };
+  const meta = {
+    name: v.name || "",
+    artists: (v.artists || []).map(a => a?.name).filter(Boolean),
+    album: v.album?.name || "",
+    durationMs: Number(v.duration_ms || 0),
+  };
+  const [lrclib, netease, qq] = await Promise.allSettled([fetchLrclibLyrics(meta), fetchNeteaseLyrics(meta), fetchQqLyrics(meta)]);
+  const chosen = pickBestLyrics({
+    lrclib: lrclib.status === "fulfilled" ? lrclib.value : null,
+    netease: netease.status === "fulfilled" ? netease.value : null,
+    qq: qq.status === "fulfilled" ? qq.value : null,
+  });
+  const result = chosen ? { lrc: chosen.lrc, translation: chosen.translation || "" } : { lrc: "", translation: "" };
+  if (chosen || (lrclib.status === "fulfilled" && netease.status === "fulfilled" && qq.status === "fulfilled")) {
+    lyricsCache.set(key, result);
+    while (lyricsCache.size > LYRIC_CACHE_MAX) lyricsCache.delete(lyricsCache.keys().next().value);
+  }
+  return result;
 }
 
 // The desktop app owns these child processes; MyGo hides their Windows consoles.
@@ -264,6 +497,10 @@ async function ensureSoloist() {
   })().finally(() => { startPromise = null; });
   return startPromise;
 }
+function warmupSoloist() {
+  if (typeof host === "undefined" || host.platform !== "windows") return;
+  ensureSoloist().catch(() => {});
+}
 async function ready() {
   const state = await ensureSoloist();
   if (!state.logged_in) throw problem("setup", "Select MyGo Soloist in the Spotify app on your phone to pair this computer, then play again.");
@@ -315,3 +552,6 @@ export async function remoteState() {
 }
 export async function remoteDevices() { const a = await ensureSoloist(); return [{ id: "soloist", name: a.device_name || "MyGo Soloist", active: !!a.is_active }]; }
 export async function remoteUse({ deviceId }) { if (deviceId !== "soloist") throw new Error("Unknown Soloist device"); await ready(); await ctl(["activate"]); }
+
+// Start Soloist in the background as soon as MyGo mounts this plugin runtime.
+if (typeof setTimeout === "function") setTimeout(warmupSoloist, 0);
