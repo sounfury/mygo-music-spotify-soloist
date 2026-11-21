@@ -128,7 +128,10 @@ function spawnProcess(program, args) {
     const msg = String(e?.message || "");
     if (/allowed|permission|grant/i.test(msg)) throw problem("setup", "Allow Spotify Soloist to start programs in its plugin settings.");
     if (/soloist(?:\.exe)?$/i.test(String(program || "")) && /no such file|cannot find|not found|enoent|executable file not found/i.test(msg)) {
-      throw Object.assign(problem("setup", "bin/soloist.exe was not found. Download Spotify Soloist and place it in the plugin's bin folder."), { missingBinary: true });
+      const missingMsg = (typeof host !== "undefined" && host.platform === "darwin") || !/\.exe$/i.test(String(program || ""))
+        ? "bin/soloist was not found. Download Spotify Soloist and place it in the plugin's bin folder."
+        : "bin/soloist.exe was not found. Download Spotify Soloist and place it in the plugin's bin folder.";
+      throw Object.assign(problem("setup", missingMsg), { missingBinary: true });
     }
     throw problem("setup", "Could not start the Soloist helper. Reinstall this plugin and its local Soloist executable.");
   }
@@ -151,13 +154,20 @@ async function processResult(program, args, timeout = 15000) {
       const lines = [];
       for (let line; (line = await p.readLine()) !== null;) lines.push(line);
       const code = await p.wait();
-      return { code, output: lines.join("\n"), error: code && (args[0] === "ctl" || program === "powershell.exe") ? (p.errorOutput?.() || "") : "" };
+      return { code, output: lines.join("\n"), error: code && (args[0] === "ctl" || program === "powershell.exe" || program === "/bin/sh") ? (p.errorOutput?.() || "") : "" };
     })(), timeout);
   } catch (e) { killProcess(p); throw e; }
 }
 async function helper(action) {
-  const r = await processResult("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `${host.dir}/scripts/soloist-host.ps1`, "-Action", action]);
-  if (r.code !== 0) throw problem("setup", "Enter your Soloist API Key in the plugin settings, or save it with scripts/soloist-host.ps1.");
+  const isMac = typeof host !== "undefined" && host.platform === "darwin";
+  const r = isMac
+    ? await processResult("/bin/sh", [`${host.dir}/scripts/soloist-host.sh`, action])
+    : await processResult("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `${host.dir}/scripts/soloist-host.ps1`, "-Action", action]);
+  if (r.code !== 0) {
+    throw problem("setup", isMac
+      ? "Enter your Soloist API Key in the plugin settings, or save it with scripts/soloist-host.sh."
+      : "Enter your Soloist API Key in the plugin settings, or save it with scripts/soloist-host.ps1.");
+  }
   try { return JSON.parse(r.output); } catch { throw new Error(t("The Soloist helper returned an invalid response.")); }
 }
 function clientId() {
@@ -633,11 +643,40 @@ export async function lyrics({ id }) {
 }
 
 // The desktop app owns these child processes; MyGo hides their Windows consoles.
-const EXE = "bin/soloist.exe";
-const SOLOIST_DOWNLOAD_URL = "https://soloist-builds.spotifycdn.com/soloist_release_windows_x86_64.zip";
+const EXE = typeof host !== "undefined" && host.platform === "darwin" ? "bin/soloist" : "bin/soloist.exe";
+const SOLOIST_TARGETS = {
+  windows: {
+    exe: "bin/soloist.exe",
+    downloadUrl: "https://soloist-builds.spotifycdn.com/soloist_release_windows_x86_64.zip",
+    versionPlatform: /windows\/x86_64/i,
+  },
+  darwin: {
+    exe: "bin/soloist",
+    downloadUrl: "https://soloist-builds.spotifycdn.com/soloist_release_osx_arm64.tar.gz",
+    versionPlatform: /(?:macos|darwin|osx)\/(?:arm64|aarch64)/i,
+  },
+};
 const SOLOIST_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const SOLOIST_EXPIRY_DAYS = 90;
 const SOLOIST_EXPIRY_WARN_DAYS = 14;
+function soloistTarget() {
+  if (typeof host === "undefined") return null;
+  if (host.platform === "windows") {
+    if (host.arch && host.arch !== "amd64" && host.arch !== "x86_64") return null;
+    return SOLOIST_TARGETS.windows;
+  }
+  if (host.platform === "darwin") {
+    if (host.arch && host.arch !== "arm64" && host.arch !== "aarch64") return null;
+    return SOLOIST_TARGETS.darwin;
+  }
+  return null;
+}
+function soloistUnsupportedError() {
+  if (typeof host !== "undefined" && host.platform === "darwin") {
+    return problem("setup", "Spotify Soloist on macOS currently supports Apple Silicon (arm64) only.");
+  }
+  return problem("setup", "This plugin currently supports Windows x64 and Apple Silicon macOS only.");
+}
 let configPromise = null, startPromise = null, startGeneration = 0, daemon = null, watcher = null;
 let soloistUpdatePromise = null, soloistUpdateState = "";
 let authState = null, playback = null, anchoredAt = 0, backendError = null;
@@ -652,9 +691,11 @@ function formatBuildDate(ts) {
   const d = new Date(ts * 1000);
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
 }
-function parseSoloistVersion(raw) {
-  const m = String(raw || "").trim().match(/^soloist\s+([0-9][^\s]*)\s+build\s+(\d+)\b.*windows\/x86_64/i);
-  if (!m) return null;
+function parseSoloistVersion(raw, platform = typeof host !== "undefined" ? host.platform : "windows") {
+  const target = SOLOIST_TARGETS[platform] || SOLOIST_TARGETS.windows;
+  const text = String(raw || "").trim();
+  const m = text.match(/^soloist\s+([0-9][^\s]*)\s+build\s+(\d+)\b/i);
+  if (!m || !target.versionPlatform.test(text)) return null;
   const buildTimestamp = Number(m[2]);
   return { version: m[1], buildTimestamp, buildDate: formatBuildDate(buildTimestamp) };
 }
@@ -685,14 +726,28 @@ function shouldUpdateSoloist(saved, remote, now = Date.now()) {
   return false;
 }
 async function runSoloistUpdater(action, force = false) {
-  if (typeof host === "undefined" || !host.dir) throw new Error(t("Automatic download of Soloist failed. Check your network or place bin/soloist.exe manually."));
-  const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `${host.dir}/scripts/soloist-host.ps1`, "-Action", action];
-  if (action === "install") {
-    args.push("-PluginDir", host.dir);
-    if (force) args.push("-ForceDownload");
+  const isMac = typeof host !== "undefined" && host.platform === "darwin";
+  const failMsg = isMac
+    ? "Automatic download of Soloist failed. Check your network or place bin/soloist manually."
+    : "Automatic download of Soloist failed. Check your network or place bin/soloist.exe manually.";
+  if (typeof host === "undefined" || !host.dir) throw new Error(t(failMsg));
+  let r;
+  if (isMac) {
+    const args = [`${host.dir}/scripts/soloist-host.sh`, action];
+    if (action === "install") {
+      args.push("--plugin-dir", host.dir);
+      if (force) args.push("--force-download");
+    }
+    r = await processResult("/bin/sh", args, 120000);
+  } else {
+    const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `${host.dir}/scripts/soloist-host.ps1`, "-Action", action];
+    if (action === "install") {
+      args.push("-PluginDir", host.dir);
+      if (force) args.push("-ForceDownload");
+    }
+    r = await processResult("powershell.exe", args, 120000);
   }
-  const r = await processResult("powershell.exe", args, 120000);
-  if (r.code !== 0) throw new Error(t("Automatic download of Soloist failed. Check your network or place bin/soloist.exe manually."));
+  if (r.code !== 0) throw new Error(t(failMsg));
   try { return JSON.parse(r.output); }
   catch { throw new Error(t("The Soloist helper returned an invalid response.")); }
 }
@@ -752,7 +807,8 @@ function stageSoloistUpdate() {
   return promise;
 }
 async function checkForSoloistUpdate({ force = false } = {}) {
-  if (typeof host === "undefined" || host.platform !== "windows" || !host.dir || typeof fetch !== "function") return { checked: false };
+  const target = soloistTarget();
+  if (!target || !host.dir || typeof fetch !== "function") return { checked: false };
   if (soloistUpdatePromise) return { checked: false };
   let saved = getSoloistBuild();
   if (saved.staged && !isSoloistPlaying() && !startPromise) {
@@ -772,7 +828,7 @@ async function checkForSoloistUpdate({ force = false } = {}) {
   const timer = abort ? setTimeout(() => abort.abort(), 8000) : null;
   let res;
   try {
-    res = await fetch(SOLOIST_DOWNLOAD_URL, abort ? { method: "HEAD", signal: abort.signal } : { method: "HEAD" });
+    res = await fetch(target.downloadUrl, abort ? { method: "HEAD", signal: abort.signal } : { method: "HEAD" });
   } catch {
     return { checked: false };
   } finally {
@@ -809,7 +865,7 @@ function playbackError(message) {
 async function resolveConfig() {
   const directKey = (host.setting?.("soloistApiKey") || "").trim();
   if (directKey) return { key: directKey, source: "setting" };
-  return { ...(await helper("config")), source: "dpapi" };
+  return { ...(await helper("config")), source: typeof host !== "undefined" && host.platform === "darwin" ? "keychain" : "dpapi" };
 }
 const dataArgs = c => (c?.dataDir ? ["-D", c.dataDir] : []);
 function config() {
@@ -1055,7 +1111,7 @@ async function ensureSoloist() {
   const runId = startGeneration;
   const promise = (async () => {
     backendError = null;
-    if (host.platform !== "windows") throw problem("setup", "This preview currently supports Windows x64 only.");
+    if (!soloistTarget()) throw soloistUnsupportedError();
     const c = await config();
     if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
     const statusArgs = ["ctl", "status", ...dataArgs(c)];
@@ -1093,7 +1149,7 @@ async function ensureSoloist() {
           if (daemon !== p) return;
           daemon = null; ++sessionRevision; disconnect();
           backendError = code === 10
-            ? Object.assign(problem("setup", "Soloist expired. Download a new Windows build from Spotify."), { expired: true })
+            ? Object.assign(problem("setup", "Soloist expired. Download a new build from Spotify."), { expired: true })
             : new Error(t("Soloist stopped. Check its installation, API key and pairing."));
           if (code === 10 && !startPromise && host.dir) {
             installSoloist({ force: true, stopRunning: false }).then(() => warmupSoloist()).catch(() => {});
@@ -1149,7 +1205,7 @@ async function ensureSoloist() {
   return promise;
 }
 function warmupSoloist() {
-  if (typeof host === "undefined" || host.platform !== "windows") return;
+  if (!soloistTarget()) return;
   ensureSoloist().then(() => checkForSoloistUpdate()).catch(() => {});
 }
 async function ready() {

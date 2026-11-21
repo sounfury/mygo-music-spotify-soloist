@@ -4,7 +4,7 @@
 
 ## 1. 项目背景
 
-`mygo-music-spotify-soloist` 是桌面音乐播放器 [MyGo Music](https://github.com/egoist/mygo-music) 的第三方 Spotify 插件（MIT 许可，当前面向 Windows x64）。
+`mygo-music-spotify-soloist` 是桌面音乐播放器 [MyGo Music](https://github.com/egoist/mygo-music) 的第三方 Spotify 插件（MIT 许可，支持 **Windows x64** 与 **Apple Silicon macOS**）。
 
 ### 为什么需要本插件
 - 传统开源 Spotify 播放客户端多依赖逆向协议库 `librespot`，近年来受 Spotify 协议持续变动与 [librespot-org/librespot#1649](https://github.com/librespot-org/librespot/issues/1649) 影响，频繁出现登录失败或断流。
@@ -21,10 +21,10 @@
 
 1. **非 Node.js 沙盒运行时**：`index.js` 运行在 MyGo Music 内置的 `moejs` JS 运行时，仅提供标准 ES 语法、定时器、`fetch` 和宿主全局对象 `host`（`host.setting`、`host.storage`、`host.spawn`、`host.t`、`host.dir`、`host.platform`、`host.openURL`、`host.waitForRedirect`、`host.signInPrompt`）。**严禁**依赖 Node.js 内置模块（`fs`、`crypto`、`Buffer`、`http`、`require` 等）。
 2. **网络白名单**：所有外部 `fetch` 域名必须在 `plugin.json` 的 `permissions.network` 中显式声明（授予 `process` 权限后宿主额外放行 `127.0.0.1`/`localhost`）。
-3. **子进程权限与托管**：`host.spawn` 只能调用 `plugin.json` 的 `permissions.process` 允许的程序（`bin/soloist.exe`、`powershell.exe`），且需要用户在 MyGo 设置中显式授权。插件禁用、撤权或 MyGo 退出时，宿主会自动 `killPrograms()` 回收所有子进程。
+3. **子进程权限与托管**：`host.spawn` 只能调用 `plugin.json` 的 `permissions.process` 允许的程序（`bin/soloist.exe`、`bin/soloist`、`powershell.exe`、`/bin/sh`），且需要用户在 MyGo 设置中显式授权。插件禁用、撤权或 MyGo 退出时，宿主会自动 `killPrograms()` 回收所有子进程。
 4. **插件生命周期**：MyGo 启动扫描只编译 `index.js` 不执行代码；当 Spotify Soloist 成为当前激活来源时才创建 VM、执行模块顶层代码并调用导出函数。
 5. **Spotify Development Mode 限制**：部分接口有更严格上限（例如 `/artists/{id}/albums` 与 `/search` 的 `limit` 必须 `<= 10`）；非自建/非协作歌单与官方推荐接口可能不可用。
-6. **Soloist 预览版特性**：当前仅支持 Windows x64；官方构建自构建日起 **90 天过期**（进程退出码 `10`）；音频播放和 Web API 播控需要 Spotify Premium 账号。
+6. **Soloist 预览版特性**：当前支持 Windows x64 与 Apple Silicon（arm64，macOS 13+）macOS（官方暂未提供 Intel Mac 构建）；官方构建自构建日起 **90 天过期**（进程退出码 `10`）；音频播放和 Web API 播控需要 Spotify Premium 账号。
 
 ---
 
@@ -35,6 +35,7 @@
 | `plugin.json` | 插件清单：ID、入口、远程播放模式（`"playback": "remote"`）、网络与进程权限、设置项与侧边栏导航 |
 | `index.js` | 插件完整核心逻辑（单文件 ESM），导出 MyGo `music.Source` 约定的所有方法 |
 | `scripts/soloist-host.ps1` | Windows 辅助脚本：`stage`/`install`（从 Spotify 官方 CDN 安全下载、MD5 与 `--version` 校验并原子安装/更新 `bin/soloist.exe`），以及可选的 DPAPI `setup`/`config`（本地加密读写 API Key） |
+| `scripts/soloist-host.sh` | macOS Apple Silicon 辅助脚本（纯 POSIX sh，零第三方依赖、强制 LF 行尾）：`stage`/`install`（从官方 CDN 下载 `soloist_release_osx_arm64.tar.gz`、MD5 与 `--version` 校验、清除 quarantine 并原子安装/更新 `bin/soloist`），以及可选的 macOS Keychain `setup`/`config` |
 | `locales/zh-CN.json` | 简体中文文案映射表，对应 `plugin.json` 与 `index.js` 中所有 `host.t(...)` / `problem(...)` 文本 |
 | `tests/plugin.test.cjs` | 零依赖 Node.js 回归测试，通过 `node:vm` 模拟宿主环境测试核心逻辑 |
 | `bin/.gitkeep` | 占位文件，提示用户将自行下载的 `soloist.exe` 放入 `bin/`（`.gitignore` 已忽略二进制） |
@@ -107,10 +108,10 @@
 node --check index.js
 node --test tests/plugin.test.cjs
 ```
-当前 43 项单测覆盖：本地进度插值与事件状态机、冷启动恢复进度解耦、超时核对与延迟起播抑制、全量播控串行化与代际抢占、Autoplay 拦截与手机接管区分、`trace` 断线重连、Soloist 自动下载/静默更新与 90 天过期自愈、按源禁用歌词与缓存失效、艺人页分页与权限降级、歌单 CRUD/分批增删/排序索引换算与资料库收藏状态、歌词解码清洗与候选打分、挂载后台预热与并发去重、纯 JS PKCE（RFC 7636/NIST 向量）、API Key UI 直填与热切换隔离、`spawnProcess` 错误分类以及 `signOut` 刷新代际隔离。
+当前 45 项单测覆盖：Windows 与 Apple Silicon macOS 双平台适配与不支持架构拦截、本地进度插值与事件状态机、冷启动恢复进度解耦、超时核对与延迟起播抑制、全量播控串行化与代际抢占、Autoplay 拦截与手机接管区分、`trace` 断线重连、Soloist 自动下载/静默更新与 90 天过期自愈、按源禁用歌词与缓存失效、艺人页分页与权限降级、歌单 CRUD/分批增删/排序索引换算与资料库收藏状态、歌词解码清洗与候选打分、挂载后台预热与并发去重、纯 JS PKCE（RFC 7636/NIST 向量）、API Key UI 直填与热切换隔离、`spawnProcess` 错误分类以及 `signOut` 刷新代际隔离。
 
 ### 修改检查清单
-- **保持单测锚点**：`tests/plugin.test.cjs` 通过字符串定位从 `index.js` 切片在 `node:vm` 中执行（依赖 `const image = items =>`、`export async function liked(`、`const LYRIC_TIMEOUT =`、`// The desktop app owns these child processes`、`const EXE = "bin/soloist.exe";`、`function onEvent(`、`async function watch(`、`async function ready()`、`let queueJob = Promise.resolve();`、`export async function remoteResume()`、`// Start Soloist in the background`）。调整结构时同步确认测试通过。
+- **保持单测锚点**：`tests/plugin.test.cjs` 通过字符串定位从 `index.js` 切片在 `node:vm` 中执行（依赖 `const image = items =>`、`export async function liked(`、`const LYRIC_TIMEOUT =`、`// The desktop app owns these child processes`、`const EXE =`、`function onEvent(`、`async function watch(`、`async function ready()`、`let queueJob = Promise.resolve();`、`export async function remoteResume()`、`// Start Soloist in the background`）。调整结构时同步确认测试通过。
 - **权限同步**：新增外部域名必须更新 `plugin.json` 的 `permissions.network`，并同步更新 `README.md` / `README.en.md` 的隐私说明。
 - **国际化同步**：新增或修改任何 `t("...")`、`problem(..., "...")` 或 `plugin.json` 面向用户的英文字符串时，必须同步维护 `locales/zh-CN.json`。
 - **凭据安全**：绝不在日志、错误信息或测试输出中打印 Soloist API Key、`access_token`、`refresh_token` 或带凭据的命令行参数。

@@ -13,7 +13,7 @@ function controller({ active = true, beforeReady, command, saved, onDelay } = {}
       return command?.(args, api) ?? '';
     },
   };
-  const sourceFrom = source.indexOf('const EXE = "bin/soloist.exe";');
+  const sourceFrom = source.indexOf('const EXE =');
   const code = source.slice(source.indexOf('function killProcess('),source.indexOf('async function helper(')) +
     source.slice(sourceFrom, source.indexOf('// Start Soloist in the background')).replaceAll('export async function','async function');
   vm.runInNewContext(code + `
@@ -182,15 +182,15 @@ test('lyrics fetches LRCLIB, NetEase and QQ Music concurrently and falls back cl
   assert.equal(trackCalls,1);
 });
 
-function warmupHarness({platform='windows',settings={},dataDir='D:/plugin-data/spotify-soloist',helperImpl,processResultImpl,spawnImpl}){
-  const from=source.indexOf('const EXE = "bin/soloist.exe";'),to=source.indexOf('async function ready()',from);
+function warmupHarness({platform='windows',arch,settings={},dataDir='D:/plugin-data/spotify-soloist',helperImpl,processResultImpl,spawnImpl}){
+  const from=source.indexOf('const EXE ='),to=source.indexOf('async function ready()',from);
   const tailFrom=source.indexOf('// Start Soloist in the background');
   assert(from>=0&&to>from&&tailFrom>to);
   const timers=[];
   const code=source.slice(from,to)+'\n'+source.slice(tailFrom);
   const c={
     Date,Math,Promise,Error,JSON,Object,String,
-    host:{platform,dataDir,setting:k=>settings[k]||'',spawn:spawnImpl},
+    host:{platform,...(arch!==undefined?{arch}:{}),dataDir,setting:k=>settings[k]||'',spawn:spawnImpl},
     t:s=>s,
     problem:(code,msg)=>Object.assign(new Error(msg),{code}),
     delay:async()=>{},
@@ -238,7 +238,7 @@ test('mount warmup schedules Soloist startup asynchronously and shares startProm
   assert.equal(spawnCount,1,'warmup and concurrent ensureSoloist must spawn daemon only once');
 });
 
-test('mount warmup swallows setup failures without poisoning later retries and skips non-Windows',async()=>{
+test('mount warmup swallows setup failures without poisoning later retries and skips unsupported platforms',async()=>{
   let attempts=0;
   const h=warmupHarness({
     helperImpl:async()=>{
@@ -263,16 +263,19 @@ test('mount warmup swallows setup failures without poisoning later retries and s
   assert.equal(attempts,2);
   assert.equal(state.logged_in,false);
 
-  let nonWinCalls=0;
-  const mac=warmupHarness({
-    platform:'darwin',
-    helperImpl:async()=>{nonWinCalls++;return {};},
-    processResultImpl:async()=>({code:0,output:'',error:''}),
-    spawnImpl:()=>{nonWinCalls++;return {closeStdin(){},readLine:async()=>null,wait:async()=>0};},
-  });
-  mac.timers[0].fn();
-  await new Promise(r=>setImmediate(r));
-  assert.equal(nonWinCalls,0);
+  // Unsupported platforms (Intel macOS, Linux) must skip warmup without spawning anything.
+  for (const [platform, arch] of [['darwin','amd64'], ['linux','amd64']]) {
+    let unsupportedCalls=0;
+    const unsupported=warmupHarness({
+      platform, arch,
+      helperImpl:async()=>{unsupportedCalls++;return {};},
+      processResultImpl:async()=>({code:0,output:'',error:''}),
+      spawnImpl:()=>{unsupportedCalls++;return {closeStdin(){},readLine:async()=>null,wait:async()=>0};},
+    });
+    unsupported.timers[0].fn();
+    await new Promise(r=>setImmediate(r));
+    assert.equal(unsupportedCalls,0,`warmup must skip ${platform}/${arch}`);
+  }
 });
 
 test('pure JS PKCE matches RFC 7636 S256 vector and works with or without Web Crypto',()=>{
@@ -462,7 +465,7 @@ test('unpaired errors do not trigger a setup lock and passive events preserve pl
   s.onEvent({type:'playback_state',status:'playing',item:{decorations:{playback:{duration_ms:10000}}},position:{position_ms:1000,speed:1}});
   assert.equal(s.getError(),'Transient failure');
 
-  const from=source.indexOf('const EXE = "bin/soloist.exe";'),to=source.indexOf('export async function browse(',from);
+  const from=source.indexOf('const EXE ='),to=source.indexOf('export async function browse(',from);
   assert(from>=0&&to>from);
   const c={
     Date,Math,Promise,Error,JSON,Object,String,
@@ -852,8 +855,8 @@ test('ctl errors expose the verb, reason and exit code while discarding raw diag
   await assert.rejects(c.call(['play','spotify:track:test']),e=>e.actionUnavailable && e.inactive && e.message==='Soloist is not the active device. (play, 3)');
 });
 
-function updaterHarness({storageInit={},fetchImpl,processResultImpl,spawnImpl}={}){
-  const from=source.indexOf('const EXE = "bin/soloist.exe";');
+function updaterHarness({platform='windows',arch,dir='D:/plugin',storageInit={},fetchImpl,processResultImpl,spawnImpl}={}){
+  const from=source.indexOf('const EXE =');
   const to=source.indexOf('// MyGo gives plugin calls 30 seconds',from);
   const helperSlice=source.slice(source.indexOf('function killProcess('),source.indexOf('async function helper('));
   assert(from>=0&&to>from);
@@ -861,8 +864,9 @@ function updaterHarness({storageInit={},fetchImpl,processResultImpl,spawnImpl}={
   const c={
     Date,Math,Number,Promise,Error,JSON,Object,String,AbortController,setTimeout,clearTimeout,
     host:{
-      platform:'windows',
-      dir:'D:/plugin',
+      platform,
+      ...(arch!==undefined?{arch}:{}),
+      dir,
       setting:k=>k==='soloistApiKey'?'test-key':'',
       storage:{get:k=>store.get(k),set:(k,v)=>store.set(k,v),remove:k=>store.delete(k)},
     },
@@ -878,7 +882,7 @@ function updaterHarness({storageInit={},fetchImpl,processResultImpl,spawnImpl}={
     code=code.replace(/async function processResult\([\s\S]*?\n\}\n/,'');
     c.processResult=processResultImpl;
   }
-  vm.runInNewContext(code+';globalThis.subject={parseSoloistVersion,soloistDaysRemaining,shouldUpdateSoloist,ensureSoloist,checkForSoloistUpdate,browse,onEvent,getStore:k=>host.storage.get(k)}',c);
+  vm.runInNewContext(code+';globalThis.subject={EXE,parseSoloistVersion,soloistDaysRemaining,shouldUpdateSoloist,ensureSoloist,checkForSoloistUpdate,browse,onEvent,getStore:k=>host.storage.get(k)}',c);
   return c.subject;
 }
 
@@ -1054,4 +1058,119 @@ test('per-source lyric disable switches skip disabled providers and setSetting c
   const refetched=await c.subject.lyrics({id:'trk-1'});
   assert.equal(refetched.lrc,'[00:01.00]QQ Line');
   assert.equal(trackCalls,2);
+});
+
+test('macOS Apple Silicon uses bin/soloist, parses macOS versions, auto-downloads via /bin/sh, and updates from osx_arm64 CDN',async()=>{
+  let missing=true,expired=true,statusChecks=0;
+  const shCalls=[],spawnedPrograms=[],headUrls=[];
+  const h=updaterHarness({
+    platform:'darwin',
+    arch:'arm64',
+    dir:'/Users/alice/Library/Application Support/MyGo Music/plugins/spotify-soloist',
+    fetchImpl:async(url,opts)=>{
+      assert.equal(opts.method,'HEAD');
+      headUrls.push(url);
+      return {ok:true,headers:{get:k=>k.toLowerCase()==='etag'?'"etag-mac-new"':k.toLowerCase()==='last-modified'?'Sat, 21 Nov 2026 12:00:00 GMT':''}};
+    },
+    processResultImpl:async(prog,args)=>{
+      if(prog==='/bin/sh'){
+        shCalls.push(Array.from(args));
+        const action=args[1];
+        const force=args.includes('--force-download');
+        if(action==='install'){
+          missing=false;
+          if(force)expired=false;
+        }
+        return {code:0,output:JSON.stringify({[action==='stage'?'staged':'installed']:true,version:action==='stage'||force?'1.4.0.3':'1.3.10.51',buildTimestamp:action==='stage'||force?1795197722:1793988108,etag:action==='stage'||force?'etag-mac-new':'etag-mac-old',lastModified:'Fri, 20 Nov 2026 18:35:19 GMT'}),error:''};
+      }
+      assert.equal(prog,'bin/soloist');
+      if(missing)throw Object.assign(new Error('missing'),{code:'setup',missingBinary:true});
+      if(args[1]==='status')return {code:++statusChecks>=2&&!expired?0:1,output:!expired&&statusChecks>=2?'running (pid 321)':'stopped',error:''};
+      return {code:0,output:'',error:''};
+    },
+    spawnImpl:(prog,args)=>{
+      spawnedPrograms.push({prog,args:Array.from(args)});
+      if(args[0]==='--device-name'){
+        const shouldExpire=expired;
+        return {closeStdin(){},kill(){},readLine:async()=>null,wait:async()=>shouldExpire?10:new Promise(()=>{})};
+      }
+      let sent=false;
+      return {
+        closeStdin(){},kill(){},
+        readLine:async()=>{
+          if(!sent){sent=true;return '{"type":"auth_state","logged_in":true,"device_name":"MyGo Soloist","is_active":true}';}
+          return new Promise(()=>{});
+        },
+        wait:async()=>0,
+      };
+    },
+  });
+
+  assert.equal(h.EXE,'bin/soloist');
+  assert.deepEqual({...h.parseSoloistVersion('soloist 1.4.0.3 build 1795197722 (20261120) (gcedbef4d51) (macos/arm64)')},{version:'1.4.0.3',buildTimestamp:1795197722,buildDate:'2026-11-20'});
+  assert.deepEqual({...h.parseSoloistVersion('soloist 1.4.0.3 build 1795197722 (20261120) (gcedbef4d51) (macos/aarch64)')},{version:'1.4.0.3',buildTimestamp:1795197722,buildDate:'2026-11-20'});
+  assert.equal(h.parseSoloistVersion('soloist 1.4.0.3 build 1795197722 (20261120) (gcedbef4d51) (windows/x86_64)'),null,'macOS must reject Windows builds');
+  assert.equal(h.parseSoloistVersion('soloist 1.4.0.3 build 1795197722 (20261120) (gcedbef4d51) (macos/arm64)','windows'),null,'Windows must reject macOS builds');
+
+  const state=await h.ensureSoloist();
+  assert.equal(state.logged_in,true);
+  assert.equal(shCalls.length,2);
+  assert.deepEqual(shCalls[0],['/Users/alice/Library/Application Support/MyGo Music/plugins/spotify-soloist/scripts/soloist-host.sh','install','--plugin-dir','/Users/alice/Library/Application Support/MyGo Music/plugins/spotify-soloist']);
+  assert.deepEqual(shCalls[1],['/Users/alice/Library/Application Support/MyGo Music/plugins/spotify-soloist/scripts/soloist-host.sh','install','--plugin-dir','/Users/alice/Library/Application Support/MyGo Music/plugins/spotify-soloist','--force-download']);
+  assert.ok(spawnedPrograms.every(p=>p.prog==='bin/soloist'));
+
+  // Force a background check against the macOS CDN archive URL while playing.
+  h.onEvent({type:'playback_state',status:'playing',is_active:true,item:{uri:'spotify:track:t1',decorations:{playback:{duration_ms:200000}}},position:{position_ms:5000,speed:1}});
+  h.getStore('soloistBuild').etag='etag-mac-old';
+  const upd=await h.checkForSoloistUpdate({force:true});
+  assert.deepEqual(headUrls,['https://soloist-builds.spotifycdn.com/soloist_release_osx_arm64.tar.gz']);
+  assert.deepEqual({...upd},{checked:true,staged:true,version:'1.4.0.3'});
+  assert.deepEqual(shCalls[2],['/Users/alice/Library/Application Support/MyGo Music/plugins/spotify-soloist/scripts/soloist-host.sh','stage']);
+});
+
+test('macOS spawnProcess, Keychain helper routing, Intel macOS rejection, and LF line endings in soloist-host.sh',async()=>{
+  const from=source.indexOf('const API ='),to=source.indexOf('// --- Catalog Mapping',from);
+  assert(from>=0&&to>from);
+  const code=source.slice(from,to).replaceAll('export async function','async function').replaceAll('export function','function');
+  const spawned=[];
+  let spawnErr=null;
+  const c={
+    Date,Math,Promise,Error,JSON,Object,String,Uint8Array,Uint32Array,URL,URLSearchParams,AbortController,setTimeout,clearTimeout,
+    playGeneration:0,stopSoloist(){},warmupSoloist(){},
+    host:{
+      platform:'darwin',arch:'arm64',dir:'/Users/alice/plugins/spotify-soloist',
+      t:s=>s,setting:()=>'',storage:{get:()=>null,set(){},remove(){}},
+      spawn:(prog,args)=>{
+        if(spawnErr)throw spawnErr;
+        spawned.push({prog,args:Array.from(args)});
+        let sent=false;
+        return {
+          closeStdin(){},
+          readLine:async()=>{if(!sent){sent=true;return '{"key":"mac-key","dataDir":"/Users/alice/Library/Application Support/soloist","cacheDir":"/Users/alice/Library/Caches/soloist"}';}return null;},
+          wait:async()=>0,
+          errorOutput:()=>'',
+        };
+      },
+    },
+  };
+  vm.runInNewContext(code+';globalThis.subject={spawnProcess,helper}',c);
+
+  spawnErr=new Error('fork/exec bin/soloist: no such file or directory');
+  assert.throws(()=>c.subject.spawnProcess('bin/soloist',[]),e=>e.code==='setup'&&e.missingBinary&&/bin\/soloist was not found/.test(e.message));
+
+  spawnErr=null;
+  const cfg=await c.subject.helper('config');
+  assert.equal(cfg.key,'mac-key');
+  assert.deepEqual(spawned,[{prog:'/bin/sh',args:['/Users/alice/plugins/spotify-soloist/scripts/soloist-host.sh','config']}]);
+
+  // Intel macOS must fail with a clear Apple Silicon requirement message; Linux with supported platforms message.
+  const intelMac=updaterHarness({platform:'darwin',arch:'amd64',spawnImpl:()=>{throw new Error('unused');}});
+  await assert.rejects(intelMac.ensureSoloist(),e=>e.code==='setup'&&/Apple Silicon/.test(e.message));
+  const linux=updaterHarness({platform:'linux',arch:'amd64',spawnImpl:()=>{throw new Error('unused');}});
+  await assert.rejects(linux.ensureSoloist(),e=>e.code==='setup'&&/Windows x64 and Apple Silicon macOS/.test(e.message));
+
+  // Shell helper script must stay strictly LF so macOS /bin/sh never fails on CRLF.
+  const shContent=fs.readFileSync(path.join(__dirname,'../scripts/soloist-host.sh'),'utf8');
+  assert.equal(shContent.includes('\r'),false,'scripts/soloist-host.sh must use LF line endings only');
+  assert.match(shContent,/^#!\/bin\/sh\n/);
 });

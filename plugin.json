@@ -17,7 +17,9 @@
     ],
     "process": [
       "bin/soloist.exe",
-      "powershell.exe"
+      "bin/soloist",
+      "powershell.exe",
+      "/bin/sh"
     ]
   },
   "settings": [
@@ -31,7 +33,7 @@
       "key": "soloistApiKey",
       "label": "Soloist API Key",
       "type": "password",
-      "help": "Your personal Soloist API key (separate from Client ID). Optional if already saved via scripts/soloist-host.ps1.",
+      "help": "Your personal Soloist API key (separate from Client ID). Optional if already saved via the local helper script.",
       "link": "https://developer.spotify.com/dashboard/soloist"
     },
     {
