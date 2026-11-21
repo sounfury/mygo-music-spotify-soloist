@@ -20,8 +20,9 @@ A Windows x64 plugin for [MyGo Music](https://github.com/egoist/mygo-music) that
   - Intercepts Spotify's automatic `[autoplay]` continuation at track end and hands queue progression back to MyGo (preserving MyGo shuffle, repeat one/all, mixed-source queues, and genuine phone takeover);
   - Local `trace` event streaming reconnects automatically with backoff, and timed-out commands are reconciled against live state to prevent desync or ghost playback.
 - **📚 Full Library & Playlist Management**: Browse personalized home recommendations, global search (tracks, albums, artists, playlists), your playlists, liked songs, and saved albums; create, rename, delete, and save playlists, add/remove tracks in batches, and reorder playlist tracks.
-- **🌐 Rich Details & Tri-Source Bilingual Lyrics**: Dedicated album and artist pages (including artist follow/unfollow), with concurrent synchronized lyrics lookup across **LRCLIB, NetEase Cloud Music, and QQ Music**—prioritizing original + Chinese translation with in-memory caching.
-- **🔍 Persistent Diagnostics Panel**: Built-in "Playback Status" sidebar page displays pairing health and persists the latest playback diagnostic (action, reason, and exit code) until the next successful play/resume.
+- **🌐 Rich Details & Configurable Tri-Source Bilingual Lyrics**: Dedicated album and artist pages (including artist follow/unfollow), with concurrent synchronized lyrics lookup across **LRCLIB, NetEase Cloud Music, and QQ Music**—prioritizing original + Chinese translation with in-memory caching—plus 3 independent toggles in plugin settings to disable any lyric provider on demand.
+- **🔄 Automatic Download & Silent Auto-Updates**: While this repository never redistributes binaries, the plugin automatically downloads, MD5/signature-verifies, and atomically installs `bin/soloist.exe` directly from Spotify's official CDN when missing, wiped by a plugin update, or expired (exit code `10`). A lightweight background `HEAD` check runs every 24 hours, staging new builds without interrupting playback and swapping them silently when idle or on next startup.
+- **🔍 Persistent Diagnostics Panel**: Built-in "Playback Status" sidebar page displays pairing health, installed Soloist engine version / days remaining before expiry, and persists the latest playback diagnostic (action, reason, and exit code) until the next successful play/resume.
 
 ## Installation & Setup
 
@@ -33,30 +34,18 @@ sounfury/mygo-music-spotify-soloist
 
 [Install in MyGo Music](mygo-music://install-plugin?repo=sounfury/mygo-music-spotify-soloist)
 
-> **Notice**: This repository distributes the plugin source code only. **The official Soloist executable must be obtained separately from Spotify.**
+> **Notice**: This repository distributes plugin source code only and bundles no binaries. **Once process execution is allowed, the plugin automatically downloads and updates `bin/soloist.exe` directly from Spotify's official CDN** (manual placement remains supported for offline environments).
 
 ---
 
-### 1. Place the official Soloist executable
+### 1. Official Soloist executable (automatic, manual fallback supported)
 
-1. Download the **x86_64 Windows** package from [Spotify's downloads page](https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates).
-2. Extract the archive to locate `soloist.exe`.
-3. In MyGo Music, go to **Settings → Plugins → + → Show Plugins Folder**. Open `spotify-soloist`, create a `bin` folder if it does not already exist, and place the executable inside:
+- **Automatic (default)**: After completing Steps 2–3 below and allowing program execution, switching to Spotify Soloist automatically fetches the latest `soloist_release_windows_x86_64.zip` from [Spotify's official downloads CDN](https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates), verifies its checksum and `--version` signature, and installs it into `bin\soloist.exe`. Future updates are checked and applied silently without interrupting playback.
+- **Manual fallback (optional)**: If your network cannot reach Spotify's CDN directly, download the **x86_64 Windows** archive from Spotify and extract `soloist.exe` to:
 
-   ```text
-   spotify-soloist/
-     plugin.json
-     index.js
-     scripts/
-     bin/
-       soloist.exe
-   ```
-
-On a default Windows installation, the destination path is:
-
-```text
-%APPDATA%\MyGo Music\plugins\spotify-soloist\bin\soloist.exe
-```
+  ```text
+  %APPDATA%\MyGo Music\plugins\spotify-soloist\bin\soloist.exe
+  ```
 
 ---
 
@@ -102,20 +91,20 @@ On a default Windows installation, the destination path is:
 | --- | --- |
 | Spotify Web API tokens & plugin settings (including UI-configured key) | MyGo's `plugin-data/spotify-soloist` directory |
 | Soloist pairing & audio cache (shared across both key modes) | `%LOCALAPPDATA%\soloist\{data,cache}` |
+| Soloist auto-update staging folder | `%LOCALAPPDATA%\MyGoSoloist\staging` |
 | Encrypted Soloist Key (optional DPAPI script mode only) | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml` |
 
 - **Process Isolation**: Only one Soloist process may access the data directory at a time. Existing pairings in the default location are preserved and reused. Signing out of the Web API account does not erase the separate Soloist device pairing.
 - **Security Notice**: While the stored key is encrypted via Windows DPAPI, Soloist currently requires the key to be passed via process command-line arguments, meaning local process monitoring tools may observe it. Avoid sharing raw command-line invocations, unredacted logs, or session folders. Spotify Web API tokens are securely stored in MyGo's local plugin storage. No user credentials or API keys are bundled with this repository.
-- **System Invocation & Network**: OAuth PKCE runs in pure JavaScript inside the plugin sandbox, so signing in to your library requires no child process. `bin/soloist.exe` is spawned for audio playback, and `powershell.exe` is only invoked if **Soloist API Key** is left blank in plugin settings and the optional DPAPI script is used. Soloist binds its local control interface strictly to `127.0.0.1` using an automatically assigned port. When fetching bilingual synchronized lyrics, only public track metadata (title, artist, album, and duration) is sent to LRCLIB (`lrclib.net`), NetEase Cloud Music (`music.163.com`), and QQ Music (`c.y.qq.com`, `u.y.qq.com`).
+- **System Invocation & Network**: OAuth PKCE runs in pure JavaScript inside the plugin sandbox, so signing in to your library requires no child process. `bin/soloist.exe` is spawned for audio playback; `powershell.exe` is only invoked when downloading/installing an official Soloist update (from the hardcoded official URL on `soloist-builds.spotifycdn.com` with MD5 and `--version` verification) or if **Soloist API Key** is left blank and the optional DPAPI script is used. Routine update checks use a lightweight pure-JS `HEAD` request to `soloist-builds.spotifycdn.com`. Soloist binds its local control interface strictly to `127.0.0.1` using an automatically assigned port. When fetching bilingual synchronized lyrics, only public track metadata (title, artist, album, and duration) is sent to LRCLIB (`lrclib.net`), NetEase Cloud Music (`music.163.com`), and QQ Music (`c.y.qq.com`, `u.y.qq.com`).
 
 ## Limitations & Updates
 
-- **Platform Support**: This preview currently supports Windows x64 only. Podcasts and automatic Soloist binary updates are not yet implemented.
+- **Platform Support**: Currently supports Windows x64 only. Podcasts are not yet implemented.
 - **Development Mode Limits**: Standard Spotify Development Mode restrictions apply, such as inaccessible editorial recommendations and limited access to playlists you neither own nor collaborate on.
 - **Playback Queue**: Tracks start directly over Soloist's local WebSocket control channel without waiting on cloud device polling; MyGo manages queue progression, shuffle, and repeat without creating temporary cloud playlists.
 - **Native Audio Rendering**: Audio decoding and output are handled entirely by the Soloist engine. MyGo's built-in software normalization, equalizer, and format settings do not apply to the external player.
-- **90-Day Build Expiry**: Official Spotify Soloist preview builds expire **90 days after their build date**. Before expiration, quit MyGo and replace `bin/soloist.exe` with a fresh build from Spotify's download portal. The plugin displays an alert when a build has expired.
-- **Plugin Updates**: Updating the plugin in MyGo may replace the entire plugin folder, including any locally added `bin/soloist.exe`. If the binary is removed after an update, simply copy `soloist.exe` back into `bin/`. Encrypted keys and device pairings are saved outside the plugin folder and remain intact.
+- **90-Day Build Expiry & Auto-Updates**: Official Spotify Soloist preview builds expire **90 days after their build date**. The plugin silently checks for newer official builds every 24 hours (and proactively within 14 days of expiry), stages verified updates in the background, and atomically replaces `bin/soloist.exe` when idle or on next startup. Missing binaries (such as after a MyGo plugin upgrade) and expired builds (exit code `10`) self-heal automatically while preserving your pairings and audio cache.
 
 ## Troubleshooting
 
@@ -130,7 +119,7 @@ On a default Windows installation, the destination path is:
 
 See [AGENTS.md](AGENTS.md) for project background, runtime constraints, and architecture details.
 
-`index.js` executes within MyGo's plugin sandbox runtime (not standard Node.js), with OAuth PKCE and all playback state management implemented in pure JavaScript; `scripts/soloist-host.ps1` remains available as an optional Windows DPAPI key storage helper. 39 built-in regression tests cover cold-start position restore, command timeout reconciliation, serialized playback controls, autoplay interception vs. phone takeover, `trace` auto-reconnect, artist page pagination/fallback, playlist editing/reordering, tri-source bilingual lyrics matching & decoding, and mount-time background warmup using mocked host interfaces without real Spotify credentials:
+`index.js` executes within MyGo's plugin sandbox runtime (not standard Node.js), with OAuth PKCE and all playback state management implemented in pure JavaScript; `scripts/soloist-host.ps1` handles verified official Soloist downloads/atomic installs and optional Windows DPAPI key storage. 43 built-in regression tests cover auto-download & silent updates, 90-day expiry self-healing, per-source lyric toggles & cache invalidation, cold-start position restore, command timeout reconciliation, serialized playback controls, autoplay interception vs. phone takeover, `trace` auto-reconnect, artist page pagination/fallback, playlist editing/reordering, tri-source bilingual lyrics matching & decoding, and mount-time background warmup using mocked host interfaces without real Spotify credentials:
 
 ```bash
 node --check index.js

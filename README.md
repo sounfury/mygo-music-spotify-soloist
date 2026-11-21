@@ -20,8 +20,9 @@
   - 自动拦截 Soloist 单曲播完后的 Spotify Autoplay 随机续播，将下一首切歌权完整交还给 MyGo（随机、单曲循环、列表循环、跨音源队列与手机端主动接管均准确区分）；
   - 本地 `trace` 事件流支持断线退避重连，超时命令二次核对真实状态，防止状态撕裂或“幽灵播放”。
 - **📚 完整曲库与歌单管理**：支持首页个性化推荐、全局搜索（单曲 / 专辑 / 艺人 / 歌单）、个人歌单、已点赞歌曲及收藏专辑；支持新建/重命名/删除/收藏歌单、向歌单批量增删歌曲与排序移动。
-- **🌐 丰富详情与三源双语同步歌词**：支持专辑和艺人主页（含关注/取消关注歌手），并发检索 **LRCLIB + 网易云音乐 + QQ 音乐** 同步歌词，优先匹配原词 + 中文翻译并内置缓存。
-- **🔍 持久化诊断面板**：侧边栏内置「播放状态」页面，完整展示配对状态及最近一次播控诊断（含动作、原因与退出码），排错一目了然。
+- **🌐 丰富详情与可开关的三源双语同步歌词**：支持专辑和艺人主页（含关注/取消关注歌手），默认并发检索 **LRCLIB + 网易云音乐 + QQ 音乐** 同步歌词（优先匹配原词 + 中文翻译并内置缓存），并可在插件设置中通过 3 个独立开关按需单独禁用任意歌词源。
+- **🔄 自动下载与无感更新 Soloist**：仓库不分发二进制文件，但插件首次检测到缺少 `bin/soloist.exe`（或 MyGo 更新插件覆盖了目录、或官方 90 天构建到期）时，会直接从 Spotify 官方 CDN 自动下载、校验 MD5 与版本签名并原子安装到 `bin/soloist.exe`；后台每 24 小时静默检查新构建，播放中仅暂存绝不打断，空闲或重启后毫秒级切换。
+- **🔍 持久化诊断面板**：侧边栏内置「播放状态」页面，完整展示配对状态、当前 `soloist.exe` 版本/剩余有效期以及最近一次播控诊断（含动作、原因与退出码），排错一目了然。
 
 ## 安装与配置
 
@@ -33,30 +34,18 @@ sounfury/mygo-music-spotify-soloist
 
 [通过 MyGo Music 一键安装](mygo-music://install-plugin?repo=sounfury/mygo-music-spotify-soloist)
 
-> **说明**：本仓库仅分发插件源代码，**Soloist 可执行程序需自行前往 Spotify 官方获取**。
+> **说明**：本仓库仅分发插件源代码，不包含任何二进制文件；但**授予进程权限后，插件会自动从 Spotify 官方 CDN 下载并维护 `bin/soloist.exe`**，无需手工解压放置（离线或特殊网络环境下亦可手动放置）。
 
 ---
 
-### 1. 放置 Soloist 官方程序
+### 1. Soloist 官方程序（自动下载，亦支持手动放置）
 
-1. 从 [Spotify 官方下载页面](https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates) 获取 **x86_64 Windows** 版本的程序压缩包。
-2. 解压得到 `soloist.exe`。
-3. 在 MyGo Music 中点击 **设置 → 插件 → ＋ → 显示插件文件夹**，进入 `spotify-soloist` 目录。在其中新建 `bin` 文件夹（若已存在则直接打开），将 `soloist.exe` 放入：
+- **自动方式（默认）**：完成下方第 2～3 步并勾选允许插件启动程序后，切换到 Spotify Soloist 来源时插件会自动从 [Spotify 官方下载源](https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates) 拉取最新的 `soloist_release_windows_x86_64.zip`，校验完整性与版本签名后自动安装到插件目录的 `bin\soloist.exe`；后续也会在后台静默检查并无感更新（不中断播放）。
+- **手动方式（可选/离线兜底）**：若网络无法直连 Spotify CDN，也可手动从官方页面下载 **x86_64 Windows** 压缩包，解压出 `soloist.exe` 放入：
 
-   ```text
-   spotify-soloist/
-     plugin.json
-     index.js
-     scripts/
-     bin/
-       soloist.exe
-   ```
-
-默认情况下，该文件的完整路径为：
-
-```text
-%APPDATA%\MyGo Music\plugins\spotify-soloist\bin\soloist.exe
-```
+  ```text
+  %APPDATA%\MyGo Music\plugins\spotify-soloist\bin\soloist.exe
+  ```
 
 ---
 
@@ -102,20 +91,20 @@ sounfury/mygo-music-spotify-soloist
 | --- | --- |
 | Spotify Web API 令牌及插件设置（含界面填写的 Key） | MyGo 目录下的 `plugin-data/spotify-soloist` |
 | Soloist 配对凭证与原声音频缓存（两种 Key 模式共用） | `%LOCALAPPDATA%\soloist\{data,cache}` |
+| Soloist 自动更新暂存目录 | `%LOCALAPPDATA%\MyGoSoloist\staging` |
 | 加密的 Soloist Key（仅可选 DPAPI 脚本模式） | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml` |
 
 - **多进程互斥**：同一数据目录在同一时间仅支持一个 Soloist 进程访问；只要保留默认路径的数据，已有的配对即可持续复用。在插件中退出 Web API 账号不会影响已建立的 Soloist 设备配对。
 - **安全提示**：虽然本地落盘的 Key 已通过 Windows DPAPI 加密，但受限于 Soloist 当前机制，启动时仍需以命令行参数方式传给进程，因而本地进程监视器可能窥见该参数。请避免公开完整的进程命令行、未脱敏日志或会话目录。Spotify Web API 的访问令牌则安全存储于 MyGo 插件本地存储中。本仓库不包含任何私有 Key 或令牌。
-- **系统调用与网络说明**：OAuth PKCE 鉴权由纯 JS 在沙盒内完成，登录曲库无需启动外部进程。播放音频时调用 `bin/soloist.exe`；仅在未于插件设置填写 Soloist API Key、回退读取可选 DPAPI 脚本时才会调用 `powershell.exe`。Soloist 本地控制端口仅监听 `127.0.0.1` 环回地址并采用动态随机端口。检索双语同步歌词时，会向 LRCLIB（`lrclib.net`）、网易云音乐（`music.163.com`）与 QQ 音乐（`c.y.qq.com`、`u.y.qq.com`）发送曲名、艺术家、专辑与时长等公开元数据。
+- **系统调用与网络说明**：OAuth PKCE 鉴权由纯 JS 在沙盒内完成，登录曲库无需启动外部进程。播放音频时调用 `bin/soloist.exe`；仅在自动下载/更新官方 `soloist.exe`（从固定官方地址 `soloist-builds.spotifycdn.com` 拉取并校验 MD5 与 `--version` 签名），或未于插件设置填写 Soloist API Key 而回退读取可选 DPAPI 脚本时才会调用 `powershell.exe`。日常更新检测仅通过纯 JS 向 `soloist-builds.spotifycdn.com` 发送轻量 `HEAD` 请求。Soloist 本地控制端口仅监听 `127.0.0.1` 环回地址并采用动态随机端口。检索双语同步歌词时，会向 LRCLIB（`lrclib.net`）、网易云音乐（`music.163.com`）与 QQ 音乐（`c.y.qq.com`、`u.y.qq.com`）发送曲名、艺术家、专辑与时长等公开元数据。
 
 ## 已知限制与更新维护
 
-- **平台支持**：当前预览版仅支持 Windows x64 系统；暂未实现播客播放以及 Soloist 程序的自动在线热更新。
+- **平台支持**：当前仅支持 Windows x64 系统；暂未实现播客播放。
 - **开发模式限制**：受 Spotify 开发者开发模式规则制约，部分非本人创建/非协作歌单可能无法读取，且 Spotify 官方推荐与电台类接口暂不可用。
 - **播放队列机制**：点播直接通过 Soloist 本地 WebSocket 通道毫秒级起播，无需绕道云端设备轮询，由 MyGo 播放器统一管理播放队列、随机与循环切歌，不会在云端生成临时播放列表。
 - **独立音频渲染**：音频流完全由 Soloist 原生引擎负责解码，MyGo 自身的软件均衡器、响度标准化及音频格式设置不会对 Soloist 生效。
-- **官方 90 天有效期限制**：Spotify 官方提供的 Soloist 预览版构建自**构建日起 90 天内有效**。请在到期前退出 MyGo，从 Spotify 官方页面下载更新的构建替换 `bin/soloist.exe`；若程序已过期，插件会在状态页给出过期提示。
-- **插件升级注意事项**：在线更新插件版本可能会全量覆盖插件安装目录，若自定义放置的 `bin/soloist.exe` 被清理，重新放入官方可执行文件即可。本地加密存储的 Key 与配对会话均保存在插件目录之外，不受更新影响。
+- **官方 90 天有效期与自动更新**：Spotify 官方 Soloist 预览版构建自**构建日起 90 天内有效**。插件会默认每 24 小时后台静默检测更新（距过期不足 14 天时积极检测），先暂存校验，在空闲或下次冷启动时无感替换 `bin/soloist.exe`；即便本机文件已过期（退出码 `10`）或因插件升级被覆盖，也会自动重新下载恢复，同时配对与缓存保持完好。
 
 ## 常见问题排查
 
@@ -130,7 +119,7 @@ sounfury/mygo-music-spotify-soloist
 
 项目背景、运行时约束与模块架构详见 [AGENTS.md](AGENTS.md)。
 
-`index.js` 运行于 MyGo 的专属插件沙盒运行时（非标准 Node.js 环境），OAuth PKCE 与全部状态管理均在沙盒内纯 JS 实现；`scripts/soloist-host.ps1` 仅作为可选的 Windows DPAPI 秘钥存取脚本保留。内置 39 项回归测试覆盖冷启动恢复进度、超时核对与延迟起播治理、全量播控串行化、Autoplay 拦截与手机接管区分、`trace` 断线重连、艺人页分页容错、歌单增删改排序、三源双语歌词匹配清洗以及挂载后台预热，均使用 Mock 宿主环境，不消耗真实账号额度：
+`index.js` 运行于 MyGo 的专属插件沙盒运行时（非标准 Node.js 环境），OAuth PKCE 与全部状态管理均在沙盒内纯 JS 实现；`scripts/soloist-host.ps1` 负责从官方 CDN 安全下载校验/原子替换 `bin/soloist.exe` 及可选的 Windows DPAPI 秘钥存取。内置 43 项回归测试覆盖自动下载与静默更新、90 天过期自愈、按源禁用歌词与缓存失效、冷启动恢复进度、超时核对与延迟起播治理、全量播控串行化、Autoplay 拦截与手机接管区分、`trace` 断线重连、艺人页分页容错、歌单增删改排序、三源双语歌词匹配清洗以及挂载后台预热，均使用 Mock 宿主环境，不消耗真实账号额度：
 
 ```bash
 node --check index.js

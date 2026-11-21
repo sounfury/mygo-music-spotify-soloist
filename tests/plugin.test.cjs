@@ -851,3 +851,207 @@ test('ctl errors expose the verb, reason and exit code while discarding raw diag
   vm.runInNewContext(source.slice(source.indexOf('async function ctl('),source.indexOf('async function ensureSoloist('))+';globalThis.call=ctl;',c);
   await assert.rejects(c.call(['play','spotify:track:test']),e=>e.actionUnavailable && e.inactive && e.message==='Soloist is not the active device. (play, 3)');
 });
+
+function updaterHarness({storageInit={},fetchImpl,processResultImpl,spawnImpl}={}){
+  const from=source.indexOf('const EXE = "bin/soloist.exe";');
+  const to=source.indexOf('// MyGo gives plugin calls 30 seconds',from);
+  const helperSlice=source.slice(source.indexOf('function killProcess('),source.indexOf('async function helper('));
+  assert(from>=0&&to>from);
+  const store=new Map(Object.entries(storageInit));
+  const c={
+    Date,Math,Number,Promise,Error,JSON,Object,String,AbortController,setTimeout,clearTimeout,
+    host:{
+      platform:'windows',
+      dir:'D:/plugin',
+      setting:k=>k==='soloistApiKey'?'test-key':'',
+      storage:{get:k=>store.get(k),set:(k,v)=>store.set(k,v),remove:k=>store.delete(k)},
+    },
+    t:s=>s,
+    problem:(code,msg)=>Object.assign(new Error(msg),{code}),
+    delay:async()=>{},
+    helper:async()=>{throw new Error('unused');},
+    spawnProcess:(prog,args)=>spawnImpl(prog,args),
+    fetch:fetchImpl,
+  };
+  let code=helperSlice+'\n'+source.slice(from,to).replaceAll('export async function','async function');
+  if(processResultImpl){
+    code=code.replace(/async function processResult\([\s\S]*?\n\}\n/,'');
+    c.processResult=processResultImpl;
+  }
+  vm.runInNewContext(code+';globalThis.subject={parseSoloistVersion,soloistDaysRemaining,shouldUpdateSoloist,ensureSoloist,checkForSoloistUpdate,browse,onEvent,getStore:k=>host.storage.get(k)}',c);
+  return c.subject;
+}
+
+test('Soloist version parsing, 90-day expiry math, and update eligibility rules',()=>{
+  const h=updaterHarness({spawnImpl:()=>{throw new Error('unused');}});
+  const parsed=h.parseSoloistVersion('soloist 1.4.0.3 build 1795197722 (20261120) (gcedbef4d51) (windows/x86_64)');
+  assert.deepEqual({...parsed},{version:'1.4.0.3',buildTimestamp:1795197722,buildDate:'2026-11-20'});
+  assert.equal(h.parseSoloistVersion('invalid output'),null);
+
+  const nowMs=1795197722*1000+10*86400000;
+  assert.equal(h.soloistDaysRemaining(1795197722,nowMs),80);
+  assert.equal(h.soloistDaysRemaining(1795197722,1795197722*1000+91*86400000),-1);
+
+  // Same ETag -> no update; changed ETag -> update; already staged same ETag -> skip duplicate stage.
+  assert.equal(h.shouldUpdateSoloist({buildTimestamp:1795197722,etag:'aaa'},{etag:'aaa',lastModifiedMs:0},nowMs),false);
+  assert.equal(h.shouldUpdateSoloist({buildTimestamp:1795197722,etag:'aaa'},{etag:'bbb',lastModifiedMs:0},nowMs),true);
+  assert.equal(h.shouldUpdateSoloist({buildTimestamp:1795197722,etag:'aaa',staged:{etag:'bbb'}},{etag:'bbb',lastModifiedMs:0},nowMs),false);
+  // First check after manual install (no saved ETag) compares Last-Modified against installed buildTimestamp.
+  assert.equal(h.shouldUpdateSoloist({buildTimestamp:1793988108,etag:''},{etag:'bbb',lastModifiedMs:1795197722*1000},nowMs),true);
+  assert.equal(h.shouldUpdateSoloist({buildTimestamp:1795197722,etag:''},{etag:'bbb',lastModifiedMs:1795197722*1000},nowMs),false);
+  // Expired binary always triggers update.
+  assert.equal(h.shouldUpdateSoloist({buildTimestamp:1793988108,etag:'aaa'},{etag:'aaa',lastModifiedMs:0},1793988108*1000+95*86400000),true);
+});
+
+test('ensureSoloist automatically downloads missing bin/soloist.exe and self-heals expired exit code 10',async()=>{
+  let missing=true,expired=true,installs=[];
+  let statusChecks=0;
+  const h=updaterHarness({
+    processResultImpl:async(prog,args)=>{
+      if(prog==='powershell.exe'){
+        const action=args[args.indexOf('-Action')+1];
+        const force=args.includes('-ForceDownload');
+        installs.push({action,force});
+        missing=false;
+        if(force)expired=false;
+        return {code:0,output:JSON.stringify({installed:true,version:force?'1.4.0.3':'1.3.10.51',buildTimestamp:force?1795197722:1793988108,etag:force?'etag-new':'etag-old',lastModified:'Fri, 20 Nov 2026 18:35:24 GMT'}),error:''};
+      }
+      if(missing)throw Object.assign(new Error('missing'),{code:'setup',missingBinary:true});
+      if(args[1]==='status')return {code:++statusChecks>=2&&!expired?0:1,output:!expired&&statusChecks>=2?'running (pid 77)':'stopped',error:''};
+      return {code:0,output:'',error:''};
+    },
+    spawnImpl:(prog,args)=>{
+      if(args[0]==='--device-name'){
+        const shouldExpire=expired;
+        return {
+          closeStdin(){},
+          kill(){},
+          readLine:async()=>null,
+          wait:async()=>shouldExpire?10:new Promise(()=>{}),
+        };
+      }
+      let sent=false;
+      return {
+        closeStdin(){},
+        kill(){},
+        readLine:async()=>{
+          if(!sent){sent=true;return '{"type":"auth_state","logged_in":true,"device_name":"MyGo Soloist","is_active":false}';}
+          return new Promise(()=>{});
+        },
+        wait:async()=>0,
+      };
+    },
+  });
+  const state=await h.ensureSoloist();
+  assert.equal(state.logged_in,true);
+  assert.deepEqual(installs,[{action:'install',force:false},{action:'install',force:true}]);
+  assert.equal(h.getStore('soloistBuild').version,'1.4.0.3');
+  assert.equal(h.getStore('soloistBuild').etag,'etag-new');
+});
+
+test('silent background update stages while playing without interrupting, swaps when idle, and shows status in browse',async()=>{
+  const psActions=[];
+  let headCalls=0;
+  const h=updaterHarness({
+    storageInit:{soloistBuild:{version:'1.3.10.51',buildTimestamp:1793988108,etag:'etag-old',checkedAt:0}},
+    fetchImpl:async(url,opts)=>{
+      assert.equal(opts.method,'HEAD');
+      headCalls++;
+      return {ok:true,headers:{get:k=>k.toLowerCase()==='etag'?'"etag-new"':k.toLowerCase()==='last-modified'?'Fri, 20 Nov 2026 18:35:24 GMT':''}};
+    },
+    processResultImpl:async(prog,args)=>{
+      if(prog==='powershell.exe'){
+        const action=args[args.indexOf('-Action')+1];
+        psActions.push(action);
+        return {code:0,output:JSON.stringify({[action==='stage'?'staged':'installed']:true,version:'1.4.0.3',buildTimestamp:1795197722,etag:'etag-new',lastModified:'Fri, 20 Nov 2026 18:35:24 GMT'}),error:''};
+      }
+      if(args[1]==='status')return {code:0,output:'running (pid 88)',error:''};
+      return {code:0,output:'',error:''};
+    },
+    spawnImpl:()=>{
+      let sent=false;
+      return {
+        closeStdin(){},
+        kill(){},
+        readLine:async()=>{
+          if(!sent){sent=true;return '{"type":"auth_state","logged_in":true,"device_name":"MyGo Soloist","is_active":true}';}
+          return new Promise(()=>{});
+        },
+        wait:async()=>0,
+      };
+    },
+  });
+
+  await h.ensureSoloist();
+  // Simulate active playback: background check must only stage and never interrupt playback.
+  h.onEvent({type:'playback_state',status:'playing',is_active:true,item:{uri:'spotify:track:t1',decorations:{playback:{duration_ms:200000}}},position:{position_ms:10000,speed:1}});
+  const whilePlaying=await h.checkForSoloistUpdate();
+  assert.deepEqual({...whilePlaying},{checked:true,staged:true,version:'1.4.0.3'});
+  assert.deepEqual(psActions,['stage']);
+
+  // Playback Status page must display installed version and pending staged update.
+  const page=await h.browse({page:'soloist'});
+  const engineSection=page.sections.find(s=>s.title==='Soloist Engine');
+  assert.ok(engineSection);
+  assert.match(engineSection.empty,/1\.3\.10\.51.*2026-11-06/);
+  assert.match(engineSection.empty,/1\.4\.0\.3/);
+
+  // Once playback pauses (idle), next check swaps the staged build cleanly without re-fetching HEAD.
+  h.onEvent({type:'playback_changed',status:'paused'});
+  const whenIdle=await h.checkForSoloistUpdate();
+  assert.deepEqual({...whenIdle},{checked:true,updated:true,version:'1.4.0.3'});
+  assert.deepEqual(psActions,['stage','install']);
+  assert.equal(headCalls,1);
+  assert.equal(h.getStore('soloistBuild').version,'1.4.0.3');
+  assert.equal(h.getStore('soloistBuild').staged,null);
+});
+
+test('per-source lyric disable switches skip disabled providers and setSetting clears lyricsCache',async()=>{
+  const from=source.indexOf('const LYRIC_TIMEOUT ='),to=source.indexOf('// The desktop app owns these child processes',from);
+  const setFrom=source.indexOf('export function setSetting('),setTo=source.indexOf('export async function account(',setFrom);
+  assert(from>=0&&to>from&&setFrom>=0&&setTo>setFrom);
+  const settings={disableLrclibLyrics:'true',disableNeteaseLyrics:'true',disableQqLyrics:''};
+  const requestedUrls=[];
+  let trackCalls=0;
+  const timedFetch=async(url)=>{
+    requestedUrls.push(String(url));
+    if(String(url).includes('c.y.qq.com')){
+      return {response:{ok:true,status:200},text:JSON.stringify({data:{song:{list:[{id:101,mid:'m1',name:'Song',singer:[{name:'Artist'}],interval:180}]}}})};
+    }
+    if(String(url).includes('u.y.qq.com')){
+      const lrc=Buffer.from('[00:01.00]QQ Line','utf8').toString('base64');
+      const trans=Buffer.from('[00:01.00]QQ 翻译','utf8').toString('base64');
+      return {response:{ok:true,status:200},text:JSON.stringify({req:{data:{lyric:lrc,trans}}})};
+    }
+    throw new Error('Unexpected provider request: '+url);
+  };
+  const c={
+    Date,Math,Map,Promise,Error,Number,String,Array,JSON,URLSearchParams,encodeURIComponent,parseInt,Infinity,
+    host:{setting:k=>settings[k]||''},
+    signOut(){},stopSoloist(){},warmupSoloist(){},
+    api:async()=>{trackCalls++;return {name:'Song',artists:[{name:'Artist'}],album:{name:'Alb'},duration_ms:180000};},
+    timedFetch,
+  };
+  const code=source.slice(from,to).replaceAll('export async function','async function')+'\n'+source.slice(setFrom,setTo).replaceAll('export function','function');
+  vm.runInNewContext(code+';globalThis.subject={lyrics,setSetting}',c);
+
+  const qqOnly=await c.subject.lyrics({id:'trk-1'});
+  assert.equal(qqOnly.lrc,'[00:01.00]QQ Line');
+  assert.equal(qqOnly.translation,'[00:01.00]QQ 翻译');
+  assert.equal(requestedUrls.some(u=>u.includes('lrclib.net')||u.includes('music.163.com')),false);
+  assert.equal(trackCalls,1);
+
+  // Toggling a lyric switch clears cache; disabling all 3 skips even the Spotify track lookup.
+  settings.disableQqLyrics='true';
+  c.subject.setSetting({key:'disableQqLyrics',value:'true'});
+  const disabledAll=await c.subject.lyrics({id:'trk-1'});
+  assert.deepEqual({...disabledAll},{lrc:'',translation:''});
+  assert.equal(trackCalls,1);
+
+  // Re-enabling QQ triggers a fresh fetch because cache was cleared.
+  settings.disableQqLyrics='false';
+  c.subject.setSetting({key:'disableQqLyrics',value:'false'});
+  const refetched=await c.subject.lyrics({id:'trk-1'});
+  assert.equal(refetched.lrc,'[00:01.00]QQ Line');
+  assert.equal(trackCalls,2);
+});

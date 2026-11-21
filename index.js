@@ -128,7 +128,7 @@ function spawnProcess(program, args) {
     const msg = String(e?.message || "");
     if (/allowed|permission|grant/i.test(msg)) throw problem("setup", "Allow Spotify Soloist to start programs in its plugin settings.");
     if (/soloist(?:\.exe)?$/i.test(String(program || "")) && /no such file|cannot find|not found|enoent|executable file not found/i.test(msg)) {
-      throw problem("setup", "bin/soloist.exe was not found. Download Spotify Soloist and place it in the plugin's bin folder.");
+      throw Object.assign(problem("setup", "bin/soloist.exe was not found. Download Spotify Soloist and place it in the plugin's bin folder."), { missingBinary: true });
     }
     throw problem("setup", "Could not start the Soloist helper. Reinstall this plugin and its local Soloist executable.");
   }
@@ -151,7 +151,7 @@ async function processResult(program, args, timeout = 15000) {
       const lines = [];
       for (let line; (line = await p.readLine()) !== null;) lines.push(line);
       const code = await p.wait();
-      return { code, output: lines.join("\n"), error: code && args[0] === "ctl" ? p.errorOutput() : "" };
+      return { code, output: lines.join("\n"), error: code && (args[0] === "ctl" || program === "powershell.exe") ? (p.errorOutput?.() || "") : "" };
     })(), timeout);
   } catch (e) { killProcess(p); throw e; }
 }
@@ -258,6 +258,9 @@ export function setSetting({ key, value }) {
   if (key === "soloistApiKey") {
     stopSoloist();
     warmupSoloist();
+  }
+  if (key === "disableLrclibLyrics" || key === "disableNeteaseLyrics" || key === "disableQqLyrics") {
+    if (typeof lyricsCache !== "undefined") lyricsCache.clear();
   }
 }
 export async function account() {
@@ -592,9 +595,16 @@ async function fetchQqLyrics(meta) {
   const translation = hasTimestamps(rawTrans) ? rawTrans : "";
   return lrc ? { lrc, translation } : null;
 }
+function lyricSourceDisabled(key) {
+  return typeof host !== "undefined" && host.setting?.(key) === "true";
+}
 export async function lyrics({ id }) {
   const key = String(id || "");
   if (!key) return { lrc: "", translation: "" };
+  const useLrclib = !lyricSourceDisabled("disableLrclibLyrics");
+  const useNetease = !lyricSourceDisabled("disableNeteaseLyrics");
+  const useQq = !lyricSourceDisabled("disableQqLyrics");
+  if (!useLrclib && !useNetease && !useQq) return { lrc: "", translation: "" };
   if (lyricsCache.has(key)) return lyricsCache.get(key);
   const v = await api("GET", `/tracks/${encodeURIComponent(key)}`);
   if (!v) return { lrc: "", translation: "" };
@@ -604,7 +614,11 @@ export async function lyrics({ id }) {
     album: v.album?.name || "",
     durationMs: Number(v.duration_ms || 0),
   };
-  const [lrclib, netease, qq] = await Promise.allSettled([fetchLrclibLyrics(meta), fetchNeteaseLyrics(meta), fetchQqLyrics(meta)]);
+  const [lrclib, netease, qq] = await Promise.allSettled([
+    useLrclib ? fetchLrclibLyrics(meta) : Promise.resolve(null),
+    useNetease ? fetchNeteaseLyrics(meta) : Promise.resolve(null),
+    useQq ? fetchQqLyrics(meta) : Promise.resolve(null),
+  ]);
   const chosen = pickBestLyrics({
     lrclib: lrclib.status === "fulfilled" ? lrclib.value : null,
     netease: netease.status === "fulfilled" ? netease.value : null,
@@ -620,13 +634,170 @@ export async function lyrics({ id }) {
 
 // The desktop app owns these child processes; MyGo hides their Windows consoles.
 const EXE = "bin/soloist.exe";
+const SOLOIST_DOWNLOAD_URL = "https://soloist-builds.spotifycdn.com/soloist_release_windows_x86_64.zip";
+const SOLOIST_UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const SOLOIST_EXPIRY_DAYS = 90;
+const SOLOIST_EXPIRY_WARN_DAYS = 14;
 let configPromise = null, startPromise = null, startGeneration = 0, daemon = null, watcher = null;
+let soloistUpdatePromise = null, soloistUpdateState = "";
 let authState = null, playback = null, anchoredAt = 0, backendError = null;
 let reconnectTimer = null, reconnectDelay = 250;
 let managed = { id: "", seen: false, replacement: "", pause: null };
 let transitionPending = false, playbackRevision = 0, eventRevision = 0, failedPlay = null;
 let sessionRevision = 0, detachedTrackId = "", signedOutAt = 0;
 let lastPlaybackError = host.storage?.get("lastPlaybackError") || "";
+function normalizeEtag(value) { return String(value || "").trim().replace(/^W\//i, "").replace(/^"+|"+$/g, ""); }
+function formatBuildDate(ts) {
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const d = new Date(ts * 1000);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+}
+function parseSoloistVersion(raw) {
+  const m = String(raw || "").trim().match(/^soloist\s+([0-9][^\s]*)\s+build\s+(\d+)\b.*windows\/x86_64/i);
+  if (!m) return null;
+  const buildTimestamp = Number(m[2]);
+  return { version: m[1], buildTimestamp, buildDate: formatBuildDate(buildTimestamp) };
+}
+function soloistDaysRemaining(buildTimestamp, now = Date.now()) {
+  if (!Number.isFinite(buildTimestamp) || buildTimestamp <= 0) return null;
+  return Math.ceil((buildTimestamp * 1000 + SOLOIST_EXPIRY_DAYS * 86400000 - now) / 86400000);
+}
+function getSoloistBuild() {
+  try {
+    const v = host.storage?.get("soloistBuild");
+    return v && typeof v === "object" ? v : {};
+  } catch { return {}; }
+}
+function saveSoloistBuild(patch) {
+  const next = { ...getSoloistBuild(), ...patch };
+  try { host.storage?.set("soloistBuild", next); } catch {}
+  return next;
+}
+function isSoloistPlaying() {
+  return !!(playback?.is_active && (playback.status === "playing" || playback.status === "buffering")) || !!managed.id;
+}
+function shouldUpdateSoloist(saved, remote, now = Date.now()) {
+  if (saved?.staged?.etag && remote?.etag && saved.staged.etag === remote.etag) return false;
+  const daysLeft = soloistDaysRemaining(saved?.buildTimestamp, now);
+  if (daysLeft !== null && daysLeft <= 0) return true;
+  if (remote?.etag && saved?.etag && remote.etag !== saved.etag) return true;
+  if (remote?.lastModifiedMs && saved?.buildTimestamp && remote.lastModifiedMs > saved.buildTimestamp * 1000 + 3600000) return true;
+  return false;
+}
+async function runSoloistUpdater(action, force = false) {
+  if (typeof host === "undefined" || !host.dir) throw new Error(t("Automatic download of Soloist failed. Check your network or place bin/soloist.exe manually."));
+  const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `${host.dir}/scripts/soloist-host.ps1`, "-Action", action];
+  if (action === "install") {
+    args.push("-PluginDir", host.dir);
+    if (force) args.push("-ForceDownload");
+  }
+  const r = await processResult("powershell.exe", args, 120000);
+  if (r.code !== 0) throw new Error(t("Automatic download of Soloist failed. Check your network or place bin/soloist.exe manually."));
+  try { return JSON.parse(r.output); }
+  catch { throw new Error(t("The Soloist helper returned an invalid response.")); }
+}
+async function inspectInstalledSoloist() {
+  const r = await processResult(EXE, ["--version"], 4000);
+  if (r.code !== 0) return null;
+  const parsed = parseSoloistVersion(r.output);
+  if (!parsed) return null;
+  const prev = getSoloistBuild();
+  const changed = prev.buildTimestamp && prev.buildTimestamp !== parsed.buildTimestamp;
+  return saveSoloistBuild({
+    version: parsed.version,
+    buildTimestamp: parsed.buildTimestamp,
+    ...(changed ? { etag: "", lastModified: "" } : {}),
+  });
+}
+function installSoloist({ force = false, stopRunning = false } = {}) {
+  if (soloistUpdatePromise) return soloistUpdatePromise;
+  const promise = (async () => {
+    soloistUpdateState = "installing";
+    if (stopRunning) stopSoloist();
+    const res = await runSoloistUpdater("install", force);
+    saveSoloistBuild({
+      version: res.version || "",
+      buildTimestamp: Number(res.buildTimestamp) || 0,
+      etag: normalizeEtag(res.etag),
+      lastModified: res.lastModified || "",
+      checkedAt: Date.now(),
+      staged: null,
+    });
+    return res;
+  })().finally(() => {
+    soloistUpdateState = "";
+    if (soloistUpdatePromise === promise) soloistUpdatePromise = null;
+  });
+  soloistUpdatePromise = promise;
+  return promise;
+}
+function stageSoloistUpdate() {
+  if (soloistUpdatePromise) return soloistUpdatePromise;
+  const promise = (async () => {
+    soloistUpdateState = "staging";
+    const res = await runSoloistUpdater("stage", false);
+    const staged = {
+      version: res.version || "",
+      buildTimestamp: Number(res.buildTimestamp) || 0,
+      etag: normalizeEtag(res.etag),
+      lastModified: res.lastModified || "",
+    };
+    saveSoloistBuild({ checkedAt: Date.now(), staged });
+    return staged;
+  })().finally(() => {
+    soloistUpdateState = "";
+    if (soloistUpdatePromise === promise) soloistUpdatePromise = null;
+  });
+  soloistUpdatePromise = promise;
+  return promise;
+}
+async function checkForSoloistUpdate({ force = false } = {}) {
+  if (typeof host === "undefined" || host.platform !== "windows" || !host.dir || typeof fetch !== "function") return { checked: false };
+  if (soloistUpdatePromise) return { checked: false };
+  let saved = getSoloistBuild();
+  if (saved.staged && !isSoloistPlaying() && !startPromise) {
+    await installSoloist({ force: false, stopRunning: true });
+    warmupSoloist();
+    return { checked: true, updated: true, version: saved.staged.version || "" };
+  }
+  if (!saved.buildTimestamp) {
+    saved = (await inspectInstalledSoloist().catch(() => null)) || saved;
+  }
+  const now = Date.now();
+  const daysLeft = soloistDaysRemaining(saved.buildTimestamp, now);
+  if (!force && saved.checkedAt && now - saved.checkedAt < SOLOIST_UPDATE_INTERVAL_MS && (daysLeft === null || daysLeft > SOLOIST_EXPIRY_WARN_DAYS)) {
+    return { checked: false };
+  }
+  const abort = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = abort ? setTimeout(() => abort.abort(), 8000) : null;
+  let res;
+  try {
+    res = await fetch(SOLOIST_DOWNLOAD_URL, abort ? { method: "HEAD", signal: abort.signal } : { method: "HEAD" });
+  } catch {
+    return { checked: false };
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+  if (!res?.ok) return { checked: false };
+  const remoteEtag = normalizeEtag(res.headers?.get?.("etag"));
+  const remoteLastModified = res.headers?.get?.("last-modified") || "";
+  const remoteLastModifiedMs = Date.parse(remoteLastModified) || 0;
+  const remote = { etag: remoteEtag, lastModified: remoteLastModified, lastModifiedMs: remoteLastModifiedMs };
+  if (!shouldUpdateSoloist(saved, remote, now)) {
+    saveSoloistBuild({
+      checkedAt: now,
+      ...(!saved.etag && remoteEtag ? { etag: remoteEtag, lastModified: remoteLastModified } : {}),
+    });
+    return { checked: true, updated: false };
+  }
+  const staged = await stageSoloistUpdate();
+  if (!isSoloistPlaying() && !startPromise) {
+    await installSoloist({ force: false, stopRunning: true });
+    warmupSoloist();
+    return { checked: true, updated: true, version: staged.version };
+  }
+  return { checked: true, staged: true, version: staged.version };
+}
 function playbackError(message) {
   if (message === lastPlaybackError) return;
   lastPlaybackError = message;
@@ -888,10 +1059,20 @@ async function ensureSoloist() {
     const c = await config();
     if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
     const statusArgs = ["ctl", "status", ...dataArgs(c)];
-    const status = await processResult(EXE, statusArgs, 6000);
+    let status;
+    try { status = await processResult(EXE, statusArgs, 6000); }
+    catch (e) {
+      if (!e?.missingBinary || !host.dir) throw e;
+      await installSoloist({ force: false, stopRunning: false });
+      if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
+      status = await processResult(EXE, statusArgs, 6000);
+    }
     if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
     if (!daemon && (status.code !== 0 || !/running \(pid/.test(status.output))) {
-      disconnect();
+      if (getSoloistBuild().staged && host.dir) {
+        try { await installSoloist({ force: false, stopRunning: false }); } catch {}
+        if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
+      }
       const daemonArgs = [
         "--device-name", "MyGo Soloist",
         "--api-key", c.key,
@@ -900,30 +1081,49 @@ async function ensureSoloist() {
         "--cache-size", "512",
         "--ws", "127.0.0.1:0",
       ];
-      const p = spawnProcess(EXE, daemonArgs);
-      daemon = p;
-      try { p.closeStdin(); } catch (e) { daemon = null; killProcess(p); throw e; }
-      // Drain stdout so the host's reader never blocks. Do not log credentials.
-      (async () => { while (await p.readLine() !== null) {} })().catch(() => {});
-      p.wait().catch(() => -1).then(code => {
-        if (daemon !== p) return;
-        daemon = null; ++sessionRevision; disconnect();
-        backendError = code === 10 ? problem("setup", "Soloist expired. Download a new Windows build from Spotify.") : new Error(t("Soloist stopped. Check its installation, API key and pairing."));
-      });
-      let started = false;
-      const until = Date.now() + 10000;
-      while (Date.now() < until) {
-        if (runId !== startGeneration) { try { p.kill?.(); } catch {} throw new Error(t("Soloist configuration changed. Try again.")); }
-        if (backendError) throw backendError;
-        let r;
-        try { r = await processResult(EXE, statusArgs, 3000); } catch (e) {
-          if (daemon === p) { daemon = null; killProcess(p); }
-          throw backendError || e;
+      for (let attempt = 0; attempt < 2; ++attempt) {
+        disconnect();
+        backendError = null;
+        const p = spawnProcess(EXE, daemonArgs);
+        daemon = p;
+        try { p.closeStdin(); } catch (e) { daemon = null; killProcess(p); throw e; }
+        // Drain stdout so the host's reader never blocks. Do not log credentials.
+        (async () => { while (await p.readLine() !== null) {} })().catch(() => {});
+        p.wait().catch(() => -1).then(code => {
+          if (daemon !== p) return;
+          daemon = null; ++sessionRevision; disconnect();
+          backendError = code === 10
+            ? Object.assign(problem("setup", "Soloist expired. Download a new Windows build from Spotify."), { expired: true })
+            : new Error(t("Soloist stopped. Check its installation, API key and pairing."));
+          if (code === 10 && !startPromise && host.dir) {
+            installSoloist({ force: true, stopRunning: false }).then(() => warmupSoloist()).catch(() => {});
+          }
+        });
+        let started = false;
+        const until = Date.now() + 10000;
+        while (Date.now() < until) {
+          if (runId !== startGeneration) { try { p.kill?.(); } catch {} throw new Error(t("Soloist configuration changed. Try again.")); }
+          if (backendError) break;
+          let r;
+          try { r = await processResult(EXE, statusArgs, 3000); } catch (e) {
+            if (daemon === p) { daemon = null; killProcess(p); }
+            throw backendError || e;
+          }
+          if (r.code === 0 && /running \(pid/.test(r.output)) { started = true; break; }
+          await delay(250);
         }
-        if (r.code === 0 && /running \(pid/.test(r.output)) { started = true; break; }
-        await delay(250);
-      }
-      if (!started) {
+        if (started) break;
+        if (backendError?.expired && attempt === 0 && host.dir) {
+          const expiredErr = backendError;
+          try {
+            await installSoloist({ force: true, stopRunning: false });
+          } catch {
+            throw expiredErr;
+          }
+          if (runId !== startGeneration) throw new Error(t("Soloist configuration changed. Try again."));
+          continue;
+        }
+        if (backendError) throw backendError;
         if (daemon === p) daemon = null;
         try { p.kill?.(); } catch {}
         throw new Error(t("Soloist started but did not respond in time. Check your API key and local firewall."));
@@ -950,7 +1150,7 @@ async function ensureSoloist() {
 }
 function warmupSoloist() {
   if (typeof host === "undefined" || host.platform !== "windows") return;
-  ensureSoloist().catch(() => {});
+  ensureSoloist().then(() => checkForSoloistUpdate()).catch(() => {});
 }
 async function ready() {
   const epoch = startGeneration;
@@ -966,8 +1166,28 @@ export async function browse({ page }) {
   try {
     const a = await within(ensureSoloist(), 5000);
     description = a.logged_in ? t("Paired and ready. Soloist runs without a terminal window when started by this plugin.") : t("Waiting for pairing: select MyGo Soloist in the Spotify app on your phone.");
-  } catch (e) { description = e.message; }
+  } catch (e) {
+    description = soloistUpdateState ? t("Downloading the latest official Spotify Soloist build...") : e.message;
+  }
   const sections = [{ title: t("Official Spotify audio"), empty: t("Soloist handles playback. Use MyGo Music to select songs and control playback. Keep this local API bound to 127.0.0.1.") }];
+  let build = getSoloistBuild();
+  if (!build.version && !soloistUpdateState) {
+    build = (await within(inspectInstalledSoloist(), 1500).catch(() => null)) || build;
+  }
+  if (soloistUpdateState) {
+    sections.unshift({ title: t("Soloist Engine"), empty: t("Downloading the latest official Spotify Soloist build...") });
+  } else if (build.version) {
+    const date = formatBuildDate(build.buildTimestamp);
+    const days = soloistDaysRemaining(build.buildTimestamp);
+    const parts = [date ? `${build.version} (${date})` : build.version];
+    if (days !== null) {
+      parts.push(days > 0 ? `${t("Expires in")} ${days} ${t("days")}` : t("Expired (auto-updating on next start)"));
+    }
+    if (build.staged?.version) {
+      parts.push(`${t("Update ready (applies automatically when idle or on restart):")} ${build.staged.version}`);
+    }
+    sections.unshift({ title: t("Soloist Engine"), empty: parts.join(" · ") });
+  }
   if (lastPlaybackError) sections.unshift({ title: t("Last Playback Error"), empty: lastPlaybackError });
   return { title: t("Playback Status"), description, sections };
 }

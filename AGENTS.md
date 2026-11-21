@@ -34,7 +34,7 @@
 | :--- | :--- |
 | `plugin.json` | 插件清单：ID、入口、远程播放模式（`"playback": "remote"`）、网络与进程权限、设置项与侧边栏导航 |
 | `index.js` | 插件完整核心逻辑（单文件 ESM），导出 MyGo `music.Source` 约定的所有方法 |
-| `scripts/soloist-host.ps1` | 可选的 Windows DPAPI 辅助脚本：`setup`（DPAPI 加密保存 API Key）与 `config`（解密输出配置，供未在插件设置中直填 Key 时回退） |
+| `scripts/soloist-host.ps1` | Windows 辅助脚本：`stage`/`install`（从 Spotify 官方 CDN 安全下载、MD5 与 `--version` 校验并原子安装/更新 `bin/soloist.exe`），以及可选的 DPAPI `setup`/`config`（本地加密读写 API Key） |
 | `locales/zh-CN.json` | 简体中文文案映射表，对应 `plugin.json` 与 `index.js` 中所有 `host.t(...)` / `problem(...)` 文本 |
 | `tests/plugin.test.cjs` | 零依赖 Node.js 回归测试，通过 `node:vm` 模拟宿主环境测试核心逻辑 |
 | `bin/.gitkeep` | 占位文件，提示用户将自行下载的 `soloist.exe` 放入 `bin/`（`.gitignore` 已忽略二进制） |
@@ -90,13 +90,13 @@
      - **QQ 音乐**：`c.y.qq.com` `client_search_cp` 搜索 + `u.y.qq.com` `PlayLyricInfo` 拉取 Base64 原文与翻译。
    - 沙盒内零依赖实现 `decodeBase64Utf8()` 与 `decodeHtmlEntities()`，通过 `cleanQqTranslation()` 清洗 QQ 翻译中的 `[kana:...]` 与 `[mm:ss.xx]//` 占位行。
    - `pickBestSong()` 基于清洗后的歌名、±3 秒时长容差、歌手匹配度及版本标签惩罚（`Live`/`Remix`/`伴奏`/`翻唱`）打分选曲。
-   - `pickBestLyrics()` 优先返回**双语同步歌词**（网易云 → QQ 音乐），无翻译时按 LRCLIB → 网易云 → QQ 音乐回退，结果写入上限 100 首的内存缓存 `lyricsCache`。
+   - `pickBestLyrics()` 优先返回**双语同步歌词**（网易云 → QQ 音乐），无翻译时按 LRCLIB → 网易云 → QQ 音乐回退，结果写入上限 100 首的内存缓存 `lyricsCache`。插件设置提供 `disableLrclibLyrics` / `disableNeteaseLyrics` / `disableQqLyrics` 三个独立开关，禁用的源不发起网络请求，切换开关时 `setSetting()` 立即清空 `lyricsCache`。
 
-4. **Soloist 生命周期、API Key 热切换与播放状态机**
+4. **Soloist 生命周期、自动下载更新与高可靠播放状态机**
+   - **自动下载与静默更新**：`ensureSoloist()` 在检测到缺少 `bin/soloist.exe`（`missingBinary`）或 90 天过期（退出码 `10`）时通过 `scripts/soloist-host.ps1 -Action install` 自动从固定官方 CDN（`soloist-builds.spotifycdn.com`）下载、校验 MD5 与 `--version` 签名并原子安装；`checkForSoloistUpdate()` 每 24 小时（距过期 ≤14 天时积极检查）通过纯 JS `HEAD` 比对 `ETag`/`Last-Modified`，播放中仅后台 `stage` 到 `%LOCALAPPDATA%\MyGoSoloist\staging` 不中断听歌，空闲或下次冷启动时瞬间替换；「播放状态」页展示当前引擎版本与剩余有效天数。
    - **API Key 双源解析与热切换**：`resolveConfig()` 优先读取插件设置中的 `soloistApiKey`（零 PowerShell 开销，且不覆写 `-D`/`-C`，直接沿用 Soloist 官方默认目录 `%LOCALAPPDATA%\soloist\{data,cache}`），留空时自动回退到 `soloist-host.ps1 -Action config`（同样指向 `%LOCALAPPDATA%\soloist\{data,cache}`），两种方式完全共享配对凭证与缓存。修改 `soloistApiKey` 时 `setSetting()` 调用 `stopSoloist()` 递增 `startGeneration`、安全回收旧 `watcher`/`daemon` 并立即以新 Key 后台预热。
-   - **挂载预热与单飞启动锁**：模块顶层通过 `setTimeout(warmupSoloist, 0)` 在事件循环首个宏任务静默触发 `ensureSoloist()`（登录后也会补触发一次），不执行 `activate`，避免抢占其他设备焦点；`startPromise` 配合 `startGeneration` 确保并发播放复用同一次启动且旧配置启动不会污染新实例，轮询超时时主动清理未响应子进程。
-   - **事件驱动状态机**：通过 `soloist.exe ctl trace` 持续消费 JSON 事件流（按 `watcher === p` 隔离旧追踪器），`positionNow()` 基于本地时钟锚点 `anchoredAt` 插值计算进度，避免依赖守护进程挂钟或高频轮询云端。
-   - **本地直连起播与代际抢占**：`remotePlay()` 直接通过本地 `soloist.exe ctl play spotify:track:<id>`（未激活时先 `ctl activate`）起播，彻底绕开 Spotify 云端 `/me/player/devices` 轮询与 `PUT /me/player/play` 延迟，并按需跳过已关闭的 `shuffle`/`repeat`；由 MyGo 播放器自身接管队列顺序与切歌。通过 `queueJob` 串行化与 `playGeneration` 代际递增实现“后点覆盖前点”与暂停取消，同时将完整播控错误记录到 `lastPlaybackError` 并在「播放状态」页展示。
+   - **挂载预热、单飞启动与断线自愈**：模块顶层通过 `setTimeout(warmupSoloist, 0)` 静默触发 `ensureSoloist()` 并在成功后执行 `checkForSoloistUpdate()`，不执行 `activate`；`watch()` 断线时采用退避自动重连并按 `watcher === p` 隔离旧追踪器，启动/探活失败自动回收所属子进程。
+   - **全量串行播控与状态一致**：所有写操作（`remotePlay` / `remotePause` / `remoteResume` / `remoteSeek` / `remoteVolume` / `remoteUse`）共享串行队列 `enqueue()` 与代际/会话校验；`playTarget()` 解耦起播确认与进度恢复（定位失败保留播放并记录诊断），对超时或延迟起播进行快照核对与保护，并基于完整快照与 `context.uri` 准确拦截 Spotify Autoplay 续播交由 MyGo 推进队列，同时保留手机端主动接管识别。
 
 ---
 
@@ -107,7 +107,7 @@
 node --check index.js
 node --test tests/plugin.test.cjs
 ```
-当前单测覆盖：本地进度插值与事件状态机、队列代际抢占与暂停取消、艺人页分页与权限降级、歌单 CRUD/分批增删/排序索引换算与资料库收藏状态、歌词解码清洗与候选打分、三源并发与缓存、挂载后台预热与并发去重、纯 JS PKCE（RFC 7636/NIST 向量）、API Key UI 直填与热切换隔离、`spawnProcess` 错误分类以及 `signOut` 刷新代际隔离。
+当前 43 项单测覆盖：本地进度插值与事件状态机、冷启动恢复进度解耦、超时核对与延迟起播抑制、全量播控串行化与代际抢占、Autoplay 拦截与手机接管区分、`trace` 断线重连、Soloist 自动下载/静默更新与 90 天过期自愈、按源禁用歌词与缓存失效、艺人页分页与权限降级、歌单 CRUD/分批增删/排序索引换算与资料库收藏状态、歌词解码清洗与候选打分、挂载后台预热与并发去重、纯 JS PKCE（RFC 7636/NIST 向量）、API Key UI 直填与热切换隔离、`spawnProcess` 错误分类以及 `signOut` 刷新代际隔离。
 
 ### 修改检查清单
 - **保持单测锚点**：`tests/plugin.test.cjs` 通过字符串定位从 `index.js` 切片在 `node:vm` 中执行（依赖 `const image = items =>`、`export async function liked(`、`const LYRIC_TIMEOUT =`、`// The desktop app owns these child processes`、`const EXE = "bin/soloist.exe";`、`function onEvent(`、`async function watch(`、`async function ready()`、`let queueJob = Promise.resolve();`、`export async function remoteResume()`、`// Start Soloist in the background`）。调整结构时同步确认测试通过。

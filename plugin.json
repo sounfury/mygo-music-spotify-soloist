@@ -1,7 +1,7 @@
 {
   "id": "spotify-soloist",
   "name": "Spotify Soloist",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "0.1.8",
   "main": "index.js",
   "playback": "remote",
@@ -9,6 +9,7 @@
     "network": [
       "api.spotify.com",
       "accounts.spotify.com",
+      "soloist-builds.spotifycdn.com",
       "lrclib.net",
       "music.163.com",
       "c.y.qq.com",
@@ -32,6 +33,24 @@
       "type": "password",
       "help": "Your personal Soloist API key (separate from Client ID). Optional if already saved via scripts/soloist-host.ps1.",
       "link": "https://developer.spotify.com/dashboard/soloist"
+    },
+    {
+      "key": "disableLrclibLyrics",
+      "label": "Disable LRCLIB lyrics",
+      "type": "boolean",
+      "help": "Turn on to stop querying lrclib.net for synchronized lyrics."
+    },
+    {
+      "key": "disableNeteaseLyrics",
+      "label": "Disable NetEase Cloud Music lyrics",
+      "type": "boolean",
+      "help": "Turn on to stop querying NetEase Cloud Music for bilingual lyrics."
+    },
+    {
+      "key": "disableQqLyrics",
+      "label": "Disable QQ Music lyrics",
+      "type": "boolean",
+      "help": "Turn on to stop querying QQ Music for bilingual lyrics."
     }
   ],
   "navigation": [
