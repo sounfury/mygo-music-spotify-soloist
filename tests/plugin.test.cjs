@@ -1,12 +1,12 @@
 const test=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs');const vm=require('node:vm');const path=require('node:path');
 const source=fs.readFileSync(path.join(__dirname,'../index.js'),'utf8');
-function controller({ active = true, beforeReady, command, saved, onDelay, apiMock, platform = 'windows', arch = 'amd64' } = {}) {
+function controller({ active = true, beforeReady, command, saved, onDelay, apiMock, settings = {}, platform = 'windows', arch = 'amd64' } = {}) {
   let now = 1000;
   const commands = [], store = saved || new Map();
   const c = {
     Date: { now: () => now }, setTimeout, clearTimeout, t: s => s,
     delay: async ms => { now += ms; onDelay?.(api, ms); },
-    host: { platform, arch, storage: { get: k => store.get(k), set: (k,v) => store.set(k,v), remove: k => store.delete(k) } },
+    host: { platform, arch, setting: k => settings[k], storage: { get: k => store.get(k), set: (k,v) => store.set(k,v), remove: k => store.delete(k) } },
     readyImpl: async () => beforeReady?.(),
     ctlImpl: async args => {
       commands.push(Array.from(args));
@@ -83,6 +83,64 @@ test('remotePlay skips redundant activate/shuffle/repeat when active, activates 
   failing.unblock();
   await assert.rejects(failing.remotePlay({ids:['t1']}),/Playback failed/);
   assert.equal(failing.getError(),'Playback failed.');
+});
+
+test('local startup volume accepts zero and is applied once per Soloist session', async () => {
+  let reportedVolume = 65;
+  const s = controller({
+    active: false,
+    settings: { localStartupVolume: ' 0 ' },
+    command(args, api) {
+      if (args[0] === 'volume') reportedVolume = Number(args[1]);
+      if (args[0] === 'now') return JSON.stringify(snapshot('previous', { status: 'paused', volume: reportedVolume }));
+      if (args[0] === 'play') api.onEvent(snapshot(args[1].slice('spotify:track:'.length), { volume: reportedVolume }));
+    },
+  });
+
+  await s.remotePlay({ ids: ['first'] });
+  assert.equal((await s.remoteState()).volume, 0);
+  await s.remoteVolume({ percent: 35 });
+  await s.remotePlay({ ids: ['second'] });
+  assert.equal((await s.remoteState()).volume, 35);
+  s.onEvent({ type: 'auth_state', logged_in: false });
+  s.onEvent({ type: 'auth_state', logged_in: true, is_active: true });
+  await s.remotePlay({ ids: ['third'] });
+
+  assert.deepEqual(s.commands, [
+    ['activate'], ['volume', '0'], ['now', '--json'], ['play', 'spotify:track:first'],
+    ['volume', '35'], ['play', 'spotify:track:second'],
+    ['volume', '0'], ['now', '--json'], ['play', 'spotify:track:third'],
+  ]);
+});
+
+test('local startup volume leaves the device alone for invalid values', async () => {
+  for (const localStartupVolume of ['', '101', '-1', '25%']) {
+    const s = controller({
+      settings: { localStartupVolume },
+      command(args, api) {
+        if (args[0] === 'play') api.onEvent(snapshot('track'));
+      },
+    });
+    await s.remotePlay({ ids: ['track'] });
+    assert.deepEqual(s.commands, [['play', 'spotify:track:track']]);
+  }
+});
+
+test('local startup volume delays playback until the device confirms it and can retry', async () => {
+  let reportedVolume = 65;
+  const s = controller({
+    settings: { localStartupVolume: '25' },
+    command(args, api) {
+      if (args[0] === 'now') return JSON.stringify(snapshot('previous', { status: 'paused', volume: reportedVolume }));
+      if (args[0] === 'play') api.onEvent(snapshot('track', { volume: reportedVolume }));
+    },
+  });
+  await assert.rejects(s.remotePlay({ ids: ['track'] }), /did not confirm the startup volume/);
+  assert.equal(s.commands.some(([command]) => command === 'play'), false);
+
+  reportedVolume = 25;
+  await s.remotePlay({ ids: ['track'] });
+  assert.deepEqual(s.commands.slice(-3), [['volume', '25'], ['now', '--json'], ['play', 'spotify:track:track']]);
 });
 
 function artistHarness(mockApi){

@@ -88,6 +88,8 @@ sounfury/mygo-music-spotify-soloist
 2. **Initial Pairing**: Ensure your computer and smartphone are connected to the same local area network (LAN/Wi-Fi). Open the official Spotify app on your phone, open the device picker, and select **MyGo Soloist (Windows)** on Windows or **MyGo Soloist (macOS)** on macOS (named per platform so multi-machine setups stay distinguishable). Soloist saves the session and will automatically reconnect on subsequent runs. You can then use MyGo for playback without keeping the official desktop client running.
 3. **Process Lifecycle**: When started by this plugin, Soloist runs silently without console windows. Quitting MyGo or disabling the plugin automatically terminates these child processes. If you already started Soloist manually with its local API enabled, the plugin can attach to it without terminating your manual process.
 
+To set the initial volume for each local Soloist session, enter a whole number from 0 to 100 in the plugin's **Local startup volume** setting. Enter 0 to mute or leave it blank to use the device's current volume. The MyGo slider displays the app's saved value and controls the device once playback starts.
+
 ## Data & Permissions
 
 | Data | Windows Location | macOS Location |

@@ -760,6 +760,7 @@ let reconnectTimer = null, reconnectDelay = 250;
 let managed = { id: "", seen: false, replacement: "", pause: null };
 let transitionPending = false, playbackRevision = 0, eventRevision = 0, failedPlay = null;
 let sessionRevision = 0, detachedTrackId = "", signedOutAt = 0;
+let startupVolumeHandled = false;
 let lastPlaybackError = host.storage?.get("lastPlaybackError") || "";
 function normalizeEtag(value) { return String(value || "").trim().replace(/^W\//i, "").replace(/^"+|"+$/g, ""); }
 function formatBuildDate(ts) {
@@ -973,6 +974,7 @@ function disconnect() {
   watcher = null;
   killProcess(old);
   forgetSnapshot();
+  startupVolumeHandled = false;
   detachedTrackId = "";
   manage();
   failedPlay = null;
@@ -992,6 +994,7 @@ function onEvent(e) {
     case "auth_state":
       if (!e.logged_in && (!authState || authState.logged_in)) {
         ++sessionRevision;
+        startupVolumeHandled = false;
         failedPlay = null;
         detachedTrackId = "";
         signedOutAt = Date.now();
@@ -1567,8 +1570,35 @@ async function activate(current, deadline, force = false) {
     if (current() && !authState?.is_active) await ctl(["activate"], budget(deadline, 4000));
   }
 }
+function setLocalVolume(percent, deadline) {
+  return ctl(["volume", String(Math.max(0, Math.min(100, Math.round(percent))))], budget(deadline, 5000));
+}
+async function applyInitialVolume(current, deadline) {
+  if (startupVolumeHandled) return;
+  const value = (host.setting?.("localStartupVolume") || "").trim();
+  const percent = Number(value);
+  if (!/^\d{1,3}$/.test(value) || percent > 100) {
+    startupVolumeHandled = true;
+    return;
+  }
+  await setLocalVolume(percent, deadline);
+  // The CLI acknowledges dispatch, so confirm the volume before starting audio.
+  const until = Math.min(deadline, Date.now() + 2000);
+  while (current()) {
+    if (Date.now() >= until) throw new Error(t("Soloist did not confirm the startup volume."));
+    try { await readSnapshot(current, until); } catch {}
+    if (!current()) return;
+    if (playback?.volume === percent) {
+      startupVolumeHandled = true;
+      return;
+    }
+    await delay(Math.max(0, Math.min(150, until - Date.now())));
+  }
+}
 async function playTarget(id, position, current, deadline, resume = false) {
   await activate(current, deadline);
+  if (!current()) return;
+  await applyInitialVolume(current, deadline);
   if (!current()) return;
   detachedTrackId = "";
   const since = playbackRevision;
@@ -1786,7 +1816,7 @@ export async function remoteSeek({ position }) {
 export async function remoteVolume({ percent }) {
   return enqueue((current, deadline) => {
     if (!isLocalTarget()) return externalVolume(percent, deadline);
-    return ctl(["volume", String(Math.max(0, Math.min(100, Math.round(percent))))], budget(deadline, 5000));
+    return setLocalVolume(percent, deadline);
   }, true, null);
 }
 async function reportObservation(read) {

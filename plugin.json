@@ -37,6 +37,11 @@
       "link": "https://developer.spotify.com/dashboard/soloist"
     },
     {
+      "key": "localStartupVolume",
+      "label": "Local startup volume",
+      "help": "Enter a whole number from 0 to 100 for the first playback in each local Soloist session. 0 mutes playback. Leave blank to use the device's current volume."
+    },
+    {
       "key": "disableLrclibLyrics",
       "label": "Disable LRCLIB lyrics",
       "type": "boolean",
