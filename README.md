@@ -1,140 +1,96 @@
-# MyGo Music 的 Spotify Soloist 插件
+# Spotify Soloist for MyGo Music
 
 简体中文 · [English](README.en.md)
 
-让 [MyGo Music](https://github.com/egoist/mygo-music) 使用 Spotify 官方 [Soloist](https://developer.spotify.com/documentation/soloist) 播放核心在后台直接播放音乐。由 Spotify Web API 提供曲库与元数据，Soloist 负责原声音频拉取、解码与输出；不依赖 librespot，无需匹配 YouTube 替代音源，亦无二次转码损耗。
+[MyGo Music](https://github.com/egoist/mygo-music) 的第三方 Spotify 插件，支持 **Windows x64** 与 **Apple Silicon macOS**。通过 **Spotify Web API** 获取曲库，由官方独立播放引擎 **[Soloist](https://developer.spotify.com/documentation/soloist)** 原生拉取并解码输出音频——无需 librespot、无替代音源、无二次转码，专为受 [librespot#1649](https://github.com/librespot-org/librespot/issues/1649) 及协议变动困扰的用户打造。
 
-> **💡 背景与适用人群**  
-> 本插件专为受 [librespot-org/librespot#1649](https://github.com/librespot-org/librespot/issues/1649) 及 Spotify 协议持续变动影响、**无法正常使用 librespot** 的用户打造。借助 Spotify 官方推出的 Soloist 独立播放引擎，彻底告别逆向协议频繁失效、音源失效或掉线等问题，即刻恢复稳定原生的 Spotify 播放体验。
+> **使用前提**：需要 **Spotify Premium** 账号；支持 **Windows x64** 与 **Apple Silicon（M 系列，macOS 13+）**（官方暂未提供 Intel Mac 构建）。Soloist 官方构建 90 天有效，插件会自动维护更新。
 
-**注意：当前支持 Windows x64 与 Apple Silicon（M 系列芯片，macOS 13+）macOS（Spotify Soloist 官方暂未提供 Intel Mac 构建；官方构建自构建日起 90 天有效）。配置 Soloist 播放器与使用 Spotify 音频播放均需拥有 Spotify Premium（高级会员）账号。**
+## 功能特性
 
-## 核心优势与功能特性
+- **原声秒播**：直连本地 Soloist 引擎，绕开云端设备轮询延迟，支持连点切歌抢占与静默后台预热。
+- **跨平台自动维护**：支持 Windows 与 Apple Silicon macOS；缺少二进制、升级覆盖或 90 天到期时自动从 Spotify 官方 CDN 下载、校验并后台静默更新，不打断播放。
+- **完整曲库与歌单管理**：支持首页推荐、全局搜索与输入实时联想、专辑/艺人主页（含关注）、个人歌单新建/重命名/删除/收藏、曲目批量增删与排序。
+- **Spotify Connect 多设备切换**：自动发现同账号在线设备（手机、电脑、音箱等），可在侧边栏「播放状态」页一键切换并控播，随时切回本机 Soloist。
+- **三源双语同步歌词**：并发检索 **LRCLIB + 网易云音乐 + QQ 音乐**（优先原词 + 中文翻译），设置页提供 3 个独立开关按需禁用。
+- **可靠控播与实用设置**：自动拦截 Spotify Autoplay 续播把切歌权交还 MyGo；支持配置 **本机起播音量（0–100）**；「播放状态」页展示版本、剩余有效期与播控诊断。
 
-- **⚡ 秒级起播，告别云端轮询卡顿**：点播直接走 Soloist 本地 WebSocket 通道触发，彻底绕开 Spotify 云端设备发现与云端播控接口的高延迟；支持连点切歌时的**代际抢占**（后点立刻覆盖前点），响应干脆利落。
-- **🎵 官方原生音质，告别 librespot 失效**：音频直接由 Spotify 官方 Soloist 引擎拉取与解码输出，纯净无二次转码、不替代音源，不受逆向协议变动与断流困扰。
-- **🚀 挂载静默预热 & 零脚本极简配置**：切换至本插件时即在后台静默拉起 Soloist 并恢复配对（无终端黑框、不抢占其他设备焦点），首播几乎零等待；支持在 MyGo 设置中直接填写 Soloist API Key 并热切换生效，OAuth PKCE 纯 JS 在沙盒内完成，日常零 PowerShell 开销。
-- **🛡️ 高可靠状态机与无缝队列接管**：
-  - 播放、暂停、恢复、拖动进度、音量调节与设备激活统一串行队列，杜绝并发竞态；
-  - 重启 MyGo 恢复上次播放进度时解耦起播与定位，避免冷启动时因定位未就绪误报播放失败；
-  - 自动拦截 Soloist 单曲播完后的 Spotify Autoplay 随机续播，将下一首切歌权完整交还给 MyGo（随机、单曲循环、列表循环、跨音源队列与手机端主动接管均准确区分）；
-  - 本地 `trace` 事件流支持断线退避重连，超时命令二次核对真实状态，防止状态撕裂或“幽灵播放”。
-- **📚 完整曲库、实时搜索联想与歌单管理**：支持首页个性化推荐、全局搜索（单曲 / 专辑 / 艺人 / 歌单）与输入实时联想（合并检索歌手/曲目/专辑并内置 60 秒缓存）、个人歌单、已点赞歌曲及收藏专辑；支持新建/重命名/删除/收藏歌单、向歌单批量增删歌曲与排序移动。
-- **📡 Spotify Connect 多设备无缝切换**：支持发现同账号下所有在线 Spotify Connect 设备（手机、Windows/Mac、音箱等）；除标准 `remoteDevices` / `remoteUse` 接口外，可直接在侧边栏「播放状态」页面的 **播放设备** 卡片中一键切换播放目标并在 MyGo 内继续控制播放/暂停/拖动进度/音量，随时一键切回零延迟本机 Soloist。
-- **🌐 丰富详情与可开关的三源双语同步歌词**：支持专辑和艺人主页（含关注/取消关注歌手），默认并发检索 **LRCLIB + 网易云音乐 + QQ 音乐** 同步歌词（优先匹配原词 + 中文翻译并内置缓存），并可在插件设置中通过 3 个独立开关按需单独禁用任意歌词源。
-- **🔄 自动下载与无感更新 Soloist**：仓库不分发二进制文件，但插件首次检测到缺少本地 Soloist 可执行文件（Windows 为 `bin/soloist.exe`，macOS 为 `bin/soloist`；或插件升级覆盖了目录、或官方 90 天构建到期）时，会直接从 Spotify 官方 CDN 自动下载、校验 MD5 与版本签名并原子安装；后台每 24 小时静默检查新构建，播放中仅暂存绝不打断，空闲或重启后毫秒级切换。
-- **🔍 持久化诊断面板**：侧边栏内置「播放状态」页面，完整展示配对状态、当前 Soloist 版本/剩余有效期以及最近一次播控诊断（含动作、原因与退出码），排错一目了然。
+## 快速开始
 
-## 安装与配置
+### 1. 安装插件
 
-在 MyGo Music 中打开 **设置 → 插件 → ＋**，输入仓库地址：
+- 在 MyGo Music 侧边栏 **插件** 页直接搜索 `spotify-soloist` 一键安装；
+- 或打开 **设置 → 插件 → ＋** 输入 `sounfury/mygo-music-spotify-soloist`，亦可点击 [通过 MyGo Music 一键安装](mygo-music://install-plugin?repo=sounfury/mygo-music-spotify-soloist)。
 
-```text
-sounfury/mygo-music-spotify-soloist
-```
+安装后在插件设置中**勾选允许插件启动外部程序**（Soloist 会自动下载安装，无需手动放置二进制）。
 
-[通过 MyGo Music 一键安装](mygo-music://install-plugin?repo=sounfury/mygo-music-spotify-soloist)
+### 2. 配置凭据并登录
 
-> **说明**：本仓库仅分发插件源代码，不包含任何二进制文件；但**授予进程权限后，插件会自动从 Spotify 官方 CDN 下载并维护对应平台的 Soloist 程序**（Windows 为 `bin/soloist.exe`，Apple Silicon macOS 为 `bin/soloist`），无需手工解压放置（离线或特殊网络环境下亦可手动放置）。
+需要配置两份独立凭据，均在 **设置 → 插件 → Spotify Soloist** 中填写：
 
----
-
-### 1. Soloist 官方程序（自动下载，亦支持手动放置）
-
-- **自动方式（默认）**：完成下方第 2～3 步并勾选允许插件启动程序后，切换到 Spotify Soloist 来源时插件会自动从 [Spotify 官方下载源](https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates) 拉取当前平台对应的最新构建（Windows x64 为 `soloist_release_windows_x86_64.zip`，Apple Silicon macOS 为 `soloist_release_osx_arm64.tar.gz`），校验完整性与版本签名后自动安装到插件的 `bin/` 目录；后续也会在后台静默检查并无感更新（不中断播放）。
-- **手动方式（可选/离线兜底）**：若网络无法直连 Spotify CDN，也可手动从官方页面下载对应压缩包并放入插件的 `bin/` 目录：
-  - **Windows x64**：解压 `soloist.exe` 放入 `%APPDATA%\MyGo Music\plugins\spotify-soloist\bin\soloist.exe`
-  - **macOS (Apple Silicon)**：解压 `soloist` 放入 `~/Library/Application Support/MyGo Music/plugins/spotify-soloist/bin/soloist`（并确保可执行：`chmod +x`）
-
----
-
-### 2. 配置 Soloist API Key
-
-1. 登录 [Spotify Soloist 控制台](https://developer.spotify.com/dashboard/soloist) 获取你的专属 API Key。（注意：**该 API Key 与下一步配置的 Web API Client ID 为两份相互独立的凭据**）。
-2. **推荐方式（直接在 MyGo 设置中填写，Windows / macOS 通用）**：在 MyGo Music 的 **设置 → 插件 → Spotify Soloist** 中找到 **Soloist API Key** 密码框，直接粘贴保存即可；修改后插件会自动使用新 Key 重启 Soloist，无需运行脚本或手动重启插件。
-3. **可选方式（系统安全存储脚本）**：若你希望将 Key 单独加密保存在系统密钥库中，可将设置里的 **Soloist API Key** 留空，并运行对应平台的本地脚本：
-   - **Windows（DPAPI）**：
-     ```powershell
-     powershell -NoProfile -ExecutionPolicy Bypass -File "$env:APPDATA\MyGo Music\plugins\spotify-soloist\scripts\soloist-host.ps1" -Action setup
-     ```
-   - **macOS（钥匙串 Keychain）**：
-     ```sh
-     /bin/sh "$HOME/Library/Application Support/MyGo Music/plugins/spotify-soloist/scripts/soloist-host.sh" setup
-     ```
-
-   在弹出的隐藏输入提示中粘贴你的 Key 并按下回车（自定义插件目录请相应调整路径）。**请切勿将 Key 分享给他人或直接粘贴在公开 Issue 中**。
-
----
-
-### 3. 授权 Spotify 音乐库
-
-1. 访问 [Spotify 开发者后台](https://developer.spotify.com/dashboard) 创建或使用已有的应用。
-2. 在应用设置中启用 Web API，并添加以下重定向回调地址（Redirect URI）：
-
+1. **Soloist API Key**：前往 [Spotify Soloist 控制台](https://developer.spotify.com/dashboard/soloist) 获取，直接粘贴到设置中的 **Soloist API Key** 密码框即可热生效。
+2. **Client ID**：前往 [Spotify 开发者后台](https://developer.spotify.com/dashboard) 创建或选择应用，启用 Web API 并添加回调地址：
    ```text
    http://127.0.0.1:43110/callback
    ```
+   将 **Client ID** 填入插件设置（无需 Client Secret；开发模式请在应用 **User Management** 中添加当前账号），点击 **登录** 完成浏览器授权。
 
-3. 在 MyGo Music 的 **设置 → 插件 → Spotify Soloist** 中填入该应用的 **Client ID**，勾选允许插件启动程序，随后点击 **登录**。
-4. 系统将在默认浏览器中打开授权页面，点击同意即可完成绑定。若应用处于 Development Mode（开发模式），请确认已在应用的 **User Management** 中将当前使用的 Spotify 账号添加为测试用户。
+### 3. 首次配对与播放
 
-*注：本插件无需配置 Client Secret。如需更换 Client ID，修改后重新点击登录即可。*
+1. 将 MyGo 音乐来源切至 **Spotify Soloist**，插件会自动下载（首次）并在后台静默拉起 Soloist。
+2. 确保手机与电脑处于**同一局域网**，打开手机 Spotify App，在可用设备中选择 **`MyGo Soloist (Windows)`** 或 **`MyGo Soloist (macOS)`** 完成首次配对。
+3. 配对凭证会自动保存在本地，之后无需开启官方桌面客户端，直接在 MyGo 内选歌播放即可。
 
----
+> **可选设置**：可在插件设置中填写 **本机起播音量**（`0`–`100` 整数，`0` 为静音，留空沿用设备当前音量），或按需关闭任意歌词源。
 
-### 4. 首次配对，之后在 MyGo 中随心播放
+<details>
+<summary>进阶：手动放置 Soloist 二进制 / 使用系统密钥库脚本保存 API Key</summary>
 
-1. 将 MyGo Music 的音乐来源切换为 **Spotify Soloist**，插件挂载后会在后台自动静默预热拉起 Soloist 播放引擎（你也可以直接点击歌曲或打开 **播放状态** 页面查看当前连接状态）。
-2. **首次使用配对**：请确保手机与电脑处于同一局域网下，打开手机端官方 Spotify App，在「可用设备」列表中点选对应平台的设备名——Windows 为 **MyGo Soloist (Windows)**，macOS 为 **MyGo Soloist (macOS)**（按平台区分，避免多台设备同名混淆）。配对成功后 Soloist 会在本地保存凭证，后续启动均会自动恢复连接。此后即可直接在 MyGo 中进行完整播放控制，无需常驻 Spotify 官方桌面客户端。
-3. **进程生命周期**：由插件启动的 Soloist 进程为静默运行；退出 MyGo 或卸载插件时会自动结束相关子进程。若你在启动 MyGo 前已手动运行了带有本地 API 的 Soloist 实例，插件亦可直接附着连接，且不会在退出时强制结束该手动进程。
+#### 离线手动放置 Soloist
+若无法直连 Spotify CDN，可从 [Spotify 官方下载页](https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates) 下载对应压缩包并放入插件 `bin/` 目录：
+- **Windows x64**：`%APPDATA%\MyGo Music\plugins\spotify-soloist\bin\soloist.exe`
+- **macOS (Apple Silicon)**：`~/Library/Application Support/MyGo Music/plugins/spotify-soloist/bin/soloist`（如被系统拦截请执行 `chmod +x` 与 `xattr -d com.apple.quarantine`）
 
-如需指定每次本机 Soloist 会话的起播音量，可在插件设置的 **本机起播音量** 中填写 0 到 100 的整数。0 为静音，留空则使用设备当前音量。MyGo 的音量滑块仍显示宿主保存的值，开始播放后可以用滑块调节设备音量。
+#### 使用系统安全存储脚本保存 Soloist API Key
+若希望将 Key 加密存于系统密钥库，请将设置里的 **Soloist API Key** 留空，并运行对应脚本按提示粘贴 Key：
+- **Windows（DPAPI）**：
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File "$env:APPDATA\MyGo Music\plugins\spotify-soloist\scripts\soloist-host.ps1" -Action setup
+  ```
+- **macOS（Keychain）**：
+  ```sh
+  /bin/sh "$HOME/Library/Application Support/MyGo Music/plugins/spotify-soloist/scripts/soloist-host.sh" setup
+  ```
 
-## 数据与权限说明
+</details>
 
-| 数据类型 | Windows 存储路径 | macOS 存储路径 |
+## 数据与权限
+
+| 数据 | Windows 路径 | macOS 路径 |
 | --- | --- | --- |
-| Spotify Web API 令牌及插件设置（含界面填写的 Key） | MyGo 目录下的 `plugin-data/spotify-soloist` | MyGo 目录下的 `plugin-data/spotify-soloist` |
-| Soloist 配对凭证与原声音频缓存（两种 Key 模式共用） | `%LOCALAPPDATA%\soloist\{data,cache}` | `~/Library/Application Support/soloist` 与 `~/Library/Caches/soloist` |
-| Soloist 自动更新暂存目录 | `%LOCALAPPDATA%\MyGoSoloist\staging` | `~/Library/Caches/MyGoSoloist/staging` |
-| 加密的 Soloist Key（仅可选脚本模式） | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml`（DPAPI） | macOS 钥匙串（Service: `MyGoSoloist`） |
+| 令牌与插件设置 | MyGo `plugin-data/spotify-soloist` | MyGo `plugin-data/spotify-soloist` |
+| Soloist 配对与缓存 | `%LOCALAPPDATA%\soloist\{data,cache}` | `~/Library/Application Support/soloist` & `~/Library/Caches/soloist` |
+| 自动更新暂存 | `%LOCALAPPDATA%\MyGoSoloist\staging` | `~/Library/Caches/MyGoSoloist/staging` |
+| 加密 Key（仅脚本模式） | `%LOCALAPPDATA%\MyGoSoloist\soloist-key.xml` | macOS 钥匙串（Service: `MyGoSoloist`） |
 
-- **多进程互斥**：同一数据目录在同一时间仅支持一个 Soloist 进程访问；只要保留默认路径的数据，已有的配对即可持续复用。在插件中退出 Web API 账号不会影响已建立的 Soloist 设备配对。
-- **安全提示**：虽然本地落盘的 Key 已通过 Windows DPAPI 或 macOS Keychain 加密，但受限于 Soloist 当前机制，启动时仍需以命令行参数方式传给进程，因而本地进程监视器可能窥见该参数。请避免公开完整的进程命令行、未脱敏日志或会话目录。Spotify Web API 的访问令牌则安全存储于 MyGo 插件本地存储中。本仓库不包含任何私有 Key 或令牌。
-- **系统调用与网络说明**：OAuth PKCE 鉴权由纯 JS 在沙盒内完成，登录曲库无需启动外部进程。播放音频时按平台调用 `bin/soloist.exe`（Windows）或 `bin/soloist`（macOS）；仅在自动下载/更新官方 Soloist（从固定官方地址 `soloist-builds.spotifycdn.com` 拉取并校验 MD5 与 `--version` 签名），或未于插件设置填写 Soloist API Key 而回退读取可选本地脚本时才会调用 `powershell.exe`（Windows）或 `/bin/sh`（macOS）。日常更新检测仅通过纯 JS 向 `soloist-builds.spotifycdn.com` 发送轻量 `HEAD` 请求。Soloist 本地控制端口仅监听 `127.0.0.1` 环回地址并采用动态随机端口。检索双语同步歌词时，会向 LRCLIB（`lrclib.net`）、网易云音乐（`music.163.com`）与 QQ 音乐（`c.y.qq.com`、`u.y.qq.com`）发送曲名、艺术家、专辑与时长等公开元数据。
+- **网络与进程**：登录走沙盒内纯 JS PKCE，无需子进程；仅自动下载/更新（固定从 `soloist-builds.spotifycdn.com` 拉取并校验 MD5 与版本签名）或脚本读取 Key 时才调用 `powershell.exe` / `/bin/sh`。曲库与授权访问 `api.spotify.com` / `accounts.spotify.com`；歌词仅向 `lrclib.net`、`music.163.com`、`c.y.qq.com`、`u.y.qq.com` 发送曲名、歌手、专辑与时长等公开信息。
+- **安全说明**：本仓库不含任何二进制与用户凭据。Soloist 本地控制仅监听 `127.0.0.1` 随机端口；但因 Soloist 需通过命令行参数接收 API Key，切勿公开未脱敏的进程命令行或会话目录。
 
-## 已知限制与更新维护
+## 常见问题与限制
 
-- **平台支持**：支持 **Windows x64** 与 **Apple Silicon（arm64，macOS 13+）macOS**；Spotify Soloist 官方暂不提供 Intel Mac 构建。暂未实现播客播放。
-- **开发模式限制**：受 Spotify 开发者开发模式规则制约，部分非本人创建/非协作歌单可能无法读取，且 Spotify 官方推荐与电台类接口暂不可用。
-- **播放队列机制**：点播直接通过 Soloist 本地 WebSocket 通道毫秒级起播，无需绕道云端设备轮询，由 MyGo 播放器统一管理播放队列、随机与循环切歌，不会在云端生成临时播放列表。
-- **独立音频渲染**：音频流完全由 Soloist 原生引擎负责解码，MyGo 自身的软件均衡器、响度标准化及音频格式设置不会对 Soloist 生效。
-- **官方 90 天有效期与自动更新**：Spotify 官方 Soloist 预览版构建自**构建日起 90 天内有效**。插件会默认每 24 小时后台静默检测更新（距过期不足 14 天时积极检测），先暂存校验，在空闲或下次冷启动时无感替换 `bin/soloist.exe`；即便本机文件已过期（退出码 `10`）或因插件升级被覆盖，也会自动重新下载恢复，同时配对与缓存保持完好。
+- **无法配对或一直连接中**：确保手机与电脑在同一局域网且登录同一 Spotify 账号；VPN、多虚拟网卡或防火墙可能拦截局域网设备发现。
+- **无法启动程序**：确认已在插件设置中允许启动外部程序；macOS 手动放入的二进制请执行 `chmod +x` 与 `xattr -d com.apple.quarantine`。
+- **声音过小或无声**：Soloist 音量、系统输出音量（及 Windows 音量合成器）相互独立，请逐项检查；另因音频由 Soloist 原生解码，MyGo 内置 EQ 与响度标准化不会生效。
+- **已有实例冲突**：如手动运行过 Soloist，请先退出后再交由插件托管。
+- **Spotify 平台限制**：开发模式下部分非自建/非协作歌单及官方推荐接口不可用；暂不支持播客播放。
 
-## 常见问题排查
+## 开发与许可
 
-- **无法启动辅助程序**：请检查 `bin/soloist.exe`（Windows）或 `bin/soloist`（macOS）是否放置在正确位置，并确认已在 MyGo 插件设置中允许该插件启动外部程序。macOS 手动下载后如遇系统拦截，可对 `bin/soloist` 执行 `chmod +x` 及 `xattr -d com.apple.quarantine`。
-- **提示先保存 API Key**：推荐直接在插件设置的 **Soloist API Key** 中填写；如使用可选脚本模式，请以与启动 MyGo Music 相同的系统用户执行对应平台的 setup 命令。
-- **提示等待配对或一直卡在正在连接**：请确保手机与电脑在同一局域网（同一 Wi-Fi 或子网），并在手机官方 Spotify App 的设备列表中选择 `MyGo Soloist (Windows)` 或 `MyGo Soloist (macOS)`。多虚拟网卡、VPN 代理或严格的防火墙规则可能会阻碍局域网设备组播发现。
-- **已成功配对但当前账号找不到设备**：插件绑定的 Web API 账号与手机端登录的 Spotify 账号必须为同一账号；此外冷启动后设备注册到云端可能需要数秒缓冲。
-- **声音过小或无声**：Soloist 设备音量、系统输出设备主音量（Windows 上还包括音量合成器中的 MyGo 音量，macOS 上请检查系统默认 Core Audio 输出设备）各自独立生效，请依次排查。
-- **已有实例在运行**：若此前手动启动过 Soloist，请先退出手动进程再由插件统一管理。保留默认数据路径即可无缝复用已有配对。
-
-## 开发与验证
-
-项目背景、运行时约束与模块架构详见 [AGENTS.md](AGENTS.md)。
-
-`index.js` 运行于 MyGo 的专属插件沙盒运行时（非标准 Node.js 环境），OAuth PKCE 与全部状态管理均在沙盒内纯 JS 实现；`scripts/soloist-host.ps1`（Windows）与 `scripts/soloist-host.sh`（macOS Apple Silicon）负责从官方 CDN 安全下载校验/原子替换 Soloist 二进制及可选的 DPAPI/Keychain 密钥存取。内置 47 项回归测试覆盖搜索实时联想、Spotify Connect 多设备发现与无缝切换、Windows/macOS 自动下载与静默更新、90 天过期自愈、按源禁用歌词与缓存失效、冷启动恢复进度、超时核对与延迟起播治理、全量播控串行化、Autoplay 拦截与手机接管区分、`trace` 断线重连、艺人页分页容错、歌单增删改排序、三源双语歌词匹配清洗以及挂载后台预热，均使用 Mock 宿主环境，不消耗真实账号额度：
+架构与开发约束详见 [AGENTS.md](AGENTS.md)。回归测试完全在 Mock 沙盒中运行，不消耗真实账号额度：
 
 ```bash
 node --check index.js
 node --test tests/plugin.test.cjs
 ```
 
-本地已全面验证 Soloist 冷启动、配对自动恢复、Spotify 曲库浏览、直接队列播控、播放/暂停/拖动进度与音量调节；并已实机验证 MyGo 拉起 Soloist 子进程及音频正常播放。其他操作系统平台或特殊账号配置仍需独立验证。
-
-本仓库通过 GitHub Releases 发布正式版本：MyGo Music 在检测到仓库存在 Release 时会自动拉取最新 Release 源码包（无需手动上传二进制附件；若仓库未发布 Release 则拉取默认分支最新 Commit）。从 `v1.1.x` 升级至 `v1.2.0` 时，因新增 macOS 所需的 `bin/soloist` 与 `/bin/sh` 进程权限，MyGo 会提示重新确认权限。本仓库已添加 `mygo-music-plugin` 标签以便被 [MyGo 插件中心](https://mygo-music.egoist.dev/plugins) 自动收录。
-
-## 开源许可
-
-本项目插件源码采用 [MIT](LICENSE) 许可协议发布。本仓库不包含且不分发 Spotify Soloist 二进制文件，其使用须遵循 Spotify 官方的使用条款与许可协议。本项目与 Spotify、MyGo Music 均无官方关联。
+源码基于 [MIT](LICENSE) 许可发布。本仓库不分发 Spotify Soloist 二进制文件，其使用须遵守 Spotify 条款；本项目与 Spotify、MyGo Music 无官方关联。
